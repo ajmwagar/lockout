@@ -354,7 +354,10 @@ job_where() { # cwd -> stdout
     done < "$dir/Cargo.toml"
   fi
   [ -n "$name" ] && { printf '%s' "$name"; return 0; }
-  printf '%s' "$dir"
+  # A workspace root has no [package] to name, and a full path is long enough to
+  # break the column. The last segment identifies it well enough to scan; --json
+  # still carries the absolute cwd for anything that needs it.
+  printf '%s' "${dir##*/}"
   return 0
 }
 
