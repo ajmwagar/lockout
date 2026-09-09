@@ -7,7 +7,9 @@
 set -uo pipefail
 
 HERE=$(cd -P "$(dirname "$0")" && pwd)
-LOCKOUT=$HERE/../bin/lockout
+# LOCKOUT_BIN lets CI point the suite at a copy with a different shebang, so
+# the same tests can be run against stock bash 3.2 and against bash 5.
+LOCKOUT=${LOCKOUT_BIN:-$HERE/../bin/lockout}
 [ -x "$LOCKOUT" ] || { echo "cannot find executable $LOCKOUT" >&2; exit 1; }
 
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/lockout-test.XXXXXX") || exit 1
@@ -187,10 +189,17 @@ r=$(printf '%s' "$js" | sed 's/.*"running":\([0-9]*\).*/\1/')
 q=$(printf '%s' "$js" | sed 's/.*"queued":\([0-9]*\).*/\1/')
 check "$r $q" "1 1"
 
-start "status --json escapes quotes in commands"
+start "recorded command round-trips through the shell"
 "$LOCKOUT" wait >/dev/null 2>&1
-"$LOCKOUT" run -q -- sh -c 'echo "quoted"' >/dev/null 2>&1
-"$LOCKOUT" status --all --json | grep -q '\\"quoted\\"' && ok || bad "quote not escaped in json"
+"$LOCKOUT" run -q -- printf '%s|' 'a b' "it's" '"dq"' '$notavar' >/dev/null 2>&1
+if command -v python3 >/dev/null 2>&1; then
+  recorded=$("$LOCKOUT" status --all --json \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["jobs"][-1]["command"])')
+  # The whole point of the recorded command is that a human can paste it back.
+  check "$(eval "$recorded")" 'a b|it'"'"'s|"dq"|$notavar|'
+else
+  ok
+fi
 
 start "json parses as valid json"
 if command -v python3 >/dev/null 2>&1; then

@@ -27,11 +27,14 @@ alive() { [ -n "${1:-}" ] && kill -0 "$1" 2>/dev/null; }
 RF=
 rf() { RF=""; [ -f "$1" ] || return 0; IFS= read -r RF < "$1" 2>/dev/null || :; return 0; }
 
-# Single-quote a string for display so a logged command can be pasted back.
+# Quote a string for display so a logged command can be pasted back into a
+# shell verbatim. Uses printf %q rather than a pattern substitution: bash 3.2
+# and 5.x disagree about backslashes in a substitution replacement, and %q is
+# the one form that means the same thing in both.
 shquote() {
   local s=${1-}
   case $s in
-    ''|*[!A-Za-z0-9_.:/=@%+,-]*) printf "'%s'" "${s//\'/\'\\\'\'}" ;;
+    ''|*[!A-Za-z0-9_.:/=@%+,-]*) printf '%q' "$s" ;;
     *) printf '%s' "$s" ;;
   esac
 }
