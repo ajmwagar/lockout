@@ -1,0 +1,709 @@
+#!/usr/bin/env bash
+#
+# lockout - a portable FIFO job queue / counting semaphore for expensive builds.
+#
+# Keeps concurrent `cargo build` / `cargo test` (or anything else expensive)
+# at or below a set limit, queues the rest first-come-first-served, and gives
+# humans and agents a way to watch what is happening.
+#
+# Dependencies: bash 3.2+ and a POSIX userland. Nothing else.
+# Mutual exclusion is built on mkdir(2), which is atomic on every filesystem
+# worth using -- flock(1) does not exist on macOS.
+
+set -uo pipefail
+
+VERSION=0.1.0
+PROG=lockout
+
+# ---------------------------------------------------------------- helpers ---
+
+die()   { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
+warn()  { printf '%s: %s\n' "$PROG" "$*" >&2; }
+now()   { date +%s; }
+alive() { [ -n "${1:-}" ] && kill -0 "$1" 2>/dev/null; }
+
+# Read the first line of a file into $RF without forking. Hot-path helper:
+# the poll loop runs this hundreds of times and $(cat) would fork every time.
+RF=
+rf() { RF=""; [ -f "$1" ] || return 0; IFS= read -r RF < "$1" 2>/dev/null || :; return 0; }
+
+# Single-quote a string for display so a logged command can be pasted back.
+shquote() {
+  local s=${1-}
+  case $s in
+    ''|*[!A-Za-z0-9_.:/=@%+,-]*) printf "'%s'" "${s//\'/\'\\\'\'}" ;;
+    *) printf '%s' "$s" ;;
+  esac
+}
+
+json_escape() {
+  local s=${1-}
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//$'\n'/\\n}
+  s=${s//$'\t'/\\t}
+  s=${s//$'\r'/}
+  printf '%s' "$s"
+}
+
+# Seconds -> M:SS or H:MM:SS
+hms() {
+  local t=${1:-0} h m s
+  case $t in ''|*[!0-9]*) t=0 ;; esac
+  h=$((t / 3600)); m=$(((t % 3600) / 60)); s=$((t % 60))
+  if [ "$h" -gt 0 ]; then printf '%d:%02d:%02d' "$h" "$m" "$s"
+  else printf '%d:%02d' "$m" "$s"; fi
+}
+
+# Absolute path to this script, following symlinks (macOS has no readlink -f).
+self_path() {
+  local src=$0 dir
+  while [ -L "$src" ]; do
+    dir=$(cd -P "$(dirname "$src")" >/dev/null 2>&1 && pwd)
+    src=$(readlink "$src")
+    case $src in /*) : ;; *) src=$dir/$src ;; esac
+  done
+  dir=$(cd -P "$(dirname "$src")" >/dev/null 2>&1 && pwd)
+  printf '%s/%s' "$dir" "$(basename "$src")"
+}
+
+# ------------------------------------------------------------------ state ---
+
+SCOPE=${LOCKOUT_SCOPE:-default}
+SCOPE=${SCOPE//\//_}
+[ -n "$SCOPE" ] || SCOPE=default
+
+if [ -n "${LOCKOUT_HOME:-}" ]; then
+  HOME_DIR=$LOCKOUT_HOME
+elif [ -n "${XDG_STATE_HOME:-}" ]; then
+  HOME_DIR=$XDG_STATE_HOME/lockout
+else
+  HOME_DIR=$HOME/.local/state/lockout
+fi
+
+SCOPE_DIR=$HOME_DIR/$SCOPE
+JOBS_DIR=$SCOPE_DIR/jobs
+CTL=$SCOPE_DIR/ctl.lock
+RETENTION=${LOCKOUT_RETENTION:-3600}   # seconds to keep finished jobs visible
+US=$'\037'                             # field separator for status rows
+
+init_state() {
+  mkdir -p "$JOBS_DIR" 2>/dev/null || die "cannot create state dir: $JOBS_DIR"
+}
+
+# ---------------------------------------------------- control-lock (mutex) ---
+
+CTL_HELD=0
+
+ctl_acquire() {
+  local tries=0 opid
+  while :; do
+    if mkdir "$CTL" 2>/dev/null; then
+      printf '%s %s\n' "$$" "$(now)" > "$CTL/owner" 2>/dev/null
+      CTL_HELD=1
+      return 0
+    fi
+    # The holder died mid-section: reclaim it rather than wedging forever.
+    if [ -f "$CTL/owner" ]; then
+      opid=""
+      rf "$CTL/owner"; opid=${RF%% *}
+      if [ -n "$opid" ] && ! alive "$opid"; then
+        warn "reclaiming control lock from dead pid $opid"
+        rm -rf "$CTL" 2>/dev/null
+        continue
+      fi
+    fi
+    tries=$((tries + 1))
+    # Critical sections are microseconds; 30s of contention means something
+    # is wedged (e.g. killed -9 between mkdir and writing owner).
+    if [ "$tries" -gt 600 ]; then
+      warn "breaking control lock after 30s with no progress"
+      rm -rf "$CTL" 2>/dev/null
+      tries=0
+      continue
+    fi
+    sleep 0.05
+  done
+}
+
+ctl_release() {
+  [ "$CTL_HELD" = 1 ] || return 0
+  CTL_HELD=0
+  rm -rf "$CTL" 2>/dev/null
+  return 0
+}
+
+# ------------------------------------------------------------ job records ---
+# One directory per job, one file per field. Field writes go through a temp
+# file + mv so a reader never sees a half-written value.
+
+setf() { # id field value
+  local d=$JOBS_DIR/$1 t
+  [ -d "$d" ] || return 0
+  t=$d/.tmp.$2.$$
+  printf '%s\n' "$3" > "$t" 2>/dev/null && mv -f "$t" "$d/$2" 2>/dev/null
+  return 0
+}
+
+getf() { # id field  -> stdout
+  local f=$JOBS_DIR/$1/$2
+  [ -f "$f" ] && cat "$f" 2>/dev/null
+  return 0
+}
+
+get_limit() {
+  local n=${LOCKOUT_LIMIT:-}
+  if [ -z "$n" ]; then rf "$SCOPE_DIR/limit"; n=$RF; fi
+  [ -n "$n" ] || n=1
+  case $n in ''|*[!0-9]*) die "invalid limit: '$n' (want a positive integer)" ;; esac
+  [ "$n" -ge 1 ] || die "invalid limit: $n (want a positive integer)"
+  printf '%s' "$n"
+}
+
+# All of the below assume the caller holds the control lock.
+
+count_state() { # state -> stdout
+  local n=0 d
+  for d in "$JOBS_DIR"/*/; do
+    [ -d "$d" ] || continue
+    rf "$d/state"
+    [ "$RF" = "$1" ] && n=$((n + 1))
+  done
+  printf '%s' "$n"
+  return 0
+}
+
+oldest_queued() { # -> stdout (job id, or empty). Glob order is lexical, and
+                  # ids are zero-padded tickets, so first match == oldest.
+  local d
+  for d in "$JOBS_DIR"/*/; do
+    [ -d "$d" ] || continue
+    rf "$d/state"
+    if [ "$RF" = queued ]; then
+      d=${d%/}; printf '%s' "${d##*/}"; return 0
+    fi
+  done
+  return 0
+}
+
+queue_position() { # id -> stdout (1-based position among queued jobs)
+  local id=$1 n=0 d b
+  for d in "$JOBS_DIR"/*/; do
+    [ -d "$d" ] || continue
+    rf "$d/state"
+    [ "$RF" = queued ] || continue
+    n=$((n + 1))
+    b=${d%/}; b=${b##*/}
+    [ "$b" = "$id" ] && { printf '%s' "$n"; return 0; }
+  done
+  printf '%s' "$n"
+  return 0
+}
+
+# Free slots held by processes that died, and prune old finished jobs so the
+# state dir does not grow without bound.
+reap() {
+  local d id st pid ended t
+  t=$(now)
+  for d in "$JOBS_DIR"/*/; do
+    [ -d "$d" ] || continue
+    id=${d%/}; id=${id##*/}
+    rf "$d/state"; st=$RF
+    case $st in
+      queued|running)
+        rf "$d/pid"; pid=$RF
+        if ! alive "$pid"; then
+          setf "$id" state done
+          setf "$id" exit 254
+          setf "$id" ended "$t"
+          setf "$id" note "abandoned (pid ${pid:-?} vanished)"
+        fi
+        ;;
+      done)
+        rf "$d/ended"; ended=$RF
+        case $ended in ''|*[!0-9]*) ended=0 ;; esac
+        if [ "$RETENTION" -ge 0 ] && [ $((t - ended)) -gt "$RETENTION" ]; then
+          rm -rf "$d" 2>/dev/null
+        fi
+        ;;
+      *)
+        # A job dir with no state file is a half-built record from a crashed
+        # enqueue; drop it once it is clearly not in flight.
+        rf "$d/pid"; pid=$RF
+        alive "$pid" || rm -rf "$d" 2>/dev/null
+        ;;
+    esac
+  done
+  return 0
+}
+
+# ------------------------------------------------------- enqueue / acquire ---
+
+JOB_ID=""
+CHILD_PID=""
+
+enqueue() { # mode tag cmd... -> stdout job id
+  local mode=$1 tag=$2; shift 2
+  local n id d cmd=""
+  for a in "$@"; do cmd="$cmd $(shquote "$a")"; done
+  cmd=${cmd# }
+
+  ctl_acquire
+  reap
+  rf "$SCOPE_DIR/seq"; n=$RF
+  case $n in ''|*[!0-9]*) n=0 ;; esac
+  n=$((n + 1))
+  printf '%s\n' "$n" > "$SCOPE_DIR/seq"
+  id=$(printf '%06d' "$n")
+  d=$JOBS_DIR/$id
+  mkdir -p "$d" || { ctl_release; die "cannot create job dir: $d"; }
+  setf "$id" pid "$$"
+  setf "$id" cmd "$cmd"
+  setf "$id" cwd "$PWD"
+  setf "$id" mode "$mode"
+  setf "$id" tag "$tag"
+  setf "$id" queued_at "$(now)"
+  setf "$id" state queued          # written last: the record is now live
+  ctl_release
+  printf '%s' "$id"
+}
+
+# Block until this job owns a slot. Returns 0 on success, 130 if cancelled.
+acquire_slot() { # id
+  local id=$1 limit running head pos last_reap=-99 last_note=0 waited=0 poll
+  local start=$SECONDS
+  while :; do
+    if [ -f "$JOBS_DIR/$id/cancel" ]; then
+      finish "$id" 130 "cancelled while queued"
+      return 130
+    fi
+
+    ctl_acquire
+    if [ $((SECONDS - last_reap)) -ge 2 ]; then reap; last_reap=$SECONDS; fi
+    limit=$(get_limit)
+    running=$(count_state running)
+    head=$(oldest_queued)
+    if [ "$running" -lt "$limit" ] && [ "$head" = "$id" ]; then
+      setf "$id" state running
+      setf "$id" started "$(now)"
+      ctl_release
+      return 0
+    fi
+    pos=$(queue_position "$id")
+    ctl_release
+
+    waited=$((SECONDS - start))
+    # Keep a blocked agent informed without spamming its transcript.
+    if [ "$QUIET" != 1 ] && [ $((waited - last_note)) -ge 15 ]; then
+      last_note=$waited
+      printf '%s: [%s] queued - position %s, %s running (limit %s), waiting %s\n' \
+        "$PROG" "$id" "$pos" "$running" "$limit" "$(hms "$waited")" >&2
+    fi
+
+    # Snappy while a slot is likely to free up soon, cheap once it is clear
+    # we are in for a long wait.
+    if   [ "$waited" -lt 2 ];  then poll=0.05
+    elif [ "$waited" -lt 60 ]; then poll=0.25
+    else poll=1
+    fi
+    sleep "$poll"
+  done
+}
+
+finish() { # id exit-code [note]
+  local id=$1 rc=$2 note=${3:-} st
+  [ -n "$id" ] || return 0
+  [ -d "$JOBS_DIR/$id" ] || return 0
+  ctl_acquire
+  rf "$JOBS_DIR/$id/state"; st=$RF
+  if [ "$st" != done ]; then
+    setf "$id" exit "$rc"
+    setf "$id" ended "$(now)"
+    [ -n "$note" ] && setf "$id" note "$note"
+    setf "$id" state done
+  fi
+  ctl_release
+  return 0
+}
+
+on_exit() {
+  local rc=$?
+  ctl_release
+  # Safety net: never leave a slot held by a process that is gone.
+  [ -n "$JOB_ID" ] && finish "$JOB_ID" "$rc" "exited without releasing"
+  return 0
+}
+
+on_signal() { # signame signum
+  local sig=$1 num=$2 i=0
+  if [ -n "$CHILD_PID" ] && alive "$CHILD_PID"; then
+    kill -"$sig" "$CHILD_PID" 2>/dev/null
+    while alive "$CHILD_PID" && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+    alive "$CHILD_PID" && kill -KILL "$CHILD_PID" 2>/dev/null
+  fi
+  finish "$JOB_ID" $((128 + num)) "received SIG$sig"
+  JOB_ID=""
+  exit $((128 + num))
+}
+
+# Run the command with the slot held. Assumes acquire_slot already returned 0.
+exec_job() { # id cmd...
+  local id=$1 rc=0; shift
+  export LOCKOUT_JOB=$id
+  export LOCKOUT_ACTIVE_SCOPE=$SCOPE
+  "$@" &
+  CHILD_PID=$!
+  setf "$id" child "$CHILD_PID"
+  wait "$CHILD_PID"; rc=$?
+  CHILD_PID=""
+  finish "$id" "$rc"
+  JOB_ID=""
+  return "$rc"
+}
+
+# A job that shells out to another lockout-wrapped command inside the same
+# scope must not queue behind itself. Re-entrant by design.
+nested() {
+  [ -n "${LOCKOUT_JOB:-}" ] && [ "${LOCKOUT_ACTIVE_SCOPE:-}" = "$SCOPE" ]
+}
+
+# ----------------------------------------------------------- subcommands ----
+
+QUIET=0
+
+cmd_run() {
+  local tag=""
+  while [ $# -gt 0 ]; do
+    case $1 in
+      -q|--quiet) QUIET=1; shift ;;
+      -t|--tag)   tag=${2:-}; shift 2 ;;
+      --)         shift; break ;;
+      -*)         die "run: unknown option '$1'" ;;
+      *)          break ;;
+    esac
+  done
+  [ $# -gt 0 ] || die "run: no command given (try: $PROG run -- cargo build)"
+
+  if nested; then
+    [ "$QUIET" = 1 ] || warn "already holding slot $LOCKOUT_JOB in scope '$SCOPE'; running inline"
+    exec "$@"
+  fi
+
+  init_state
+  trap on_exit EXIT
+  trap 'on_signal INT 2' INT
+  trap 'on_signal TERM 15' TERM
+  trap 'on_signal HUP 1' HUP
+
+  JOB_ID=$(enqueue run "$tag" "$@")
+  acquire_slot "$JOB_ID" || return $?
+  exec_job "$JOB_ID" "$@"
+}
+
+cmd_submit() {
+  local tag=""
+  while [ $# -gt 0 ]; do
+    case $1 in
+      -q|--quiet) QUIET=1; shift ;;
+      -t|--tag)   tag=${2:-}; shift 2 ;;
+      --)         shift; break ;;
+      -*)         die "submit: unknown option '$1'" ;;
+      *)          break ;;
+    esac
+  done
+  [ $# -gt 0 ] || die "submit: no command given"
+
+  init_state
+  local id child
+  id=$(enqueue submit "$tag" "$@")
+  : > "$JOBS_DIR/$id/log"
+  # The record is enqueued with our pid, so the reaper cannot mistake it for
+  # abandoned before the worker takes over on the next line.
+  nohup "$SELF" __worker "$id" "$@" >>"$JOBS_DIR/$id/log" 2>&1 &
+  child=$!
+  setf "$id" pid "$child"
+  if [ "$QUIET" = 1 ]; then
+    printf '%s\n' "$id"          # scriptable: bare id on stdout
+  else
+    printf 'submitted %s: %s\n' "$id" "$(getf "$id" cmd)"
+  fi
+  return 0
+}
+
+# Internal: the detached half of `submit`.
+cmd_worker() {
+  local id=${1:-}; shift
+  [ -n "$id" ] || die "__worker: missing job id"
+  init_state
+  JOB_ID=$id
+  QUIET=1
+  setf "$id" pid "$$"
+  trap on_exit EXIT
+  trap 'on_signal INT 2' INT
+  trap 'on_signal TERM 15' TERM
+  trap 'on_signal HUP 1' HUP
+  acquire_slot "$id" || return $?
+  exec_job "$id" "$@"
+}
+
+# Emit one row per job. Callers hold no lock; a torn read just shows stale
+# state for one tick, which is fine for a status display.
+# Fields are separated by US (\037), not tab: tab is an IFS whitespace
+# character, so bash would collapse adjacent tabs and shift every field after
+# an empty one.
+status_rows() { # -> id US state US wait US run US pid US exit US cwd US cmd US tag US note
+  local d id st q s e t wait run cwd cmd tag note pid rc
+  t=$(now)
+  for d in "$JOBS_DIR"/*/; do
+    [ -d "$d" ] || continue
+    id=${d%/}; id=${id##*/}
+    rf "$d/state"; st=$RF
+    [ -n "$st" ] || continue
+    rf "$d/queued_at"; q=$RF; case $q in ''|*[!0-9]*) q=$t ;; esac
+    rf "$d/started";   s=$RF
+    rf "$d/ended";     e=$RF
+    rf "$d/pid";       pid=$RF
+    rf "$d/exit";      rc=$RF
+    rf "$d/tag";       tag=$RF
+    rf "$d/note";      note=$RF
+    cwd=$(getf "$id" cwd)
+    cmd=$(getf "$id" cmd)
+    case $s in ''|*[!0-9]*) wait=$((t - q)); run=-1 ;;
+      *) wait=$((s - q))
+         case $e in ''|*[!0-9]*) run=$((t - s)) ;; *) run=$((e - s)) ;; esac ;;
+    esac
+    cmd=${cmd//$US/ }; cwd=${cwd//$US/ }; tag=${tag//$US/ }; note=${note//$US/ }
+    printf '%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s\n' \
+      "$id" "$US" "$st" "$US" "$wait" "$US" "$run" "$US" "${pid:-}" "$US" \
+      "${rc:-}" "$US" "$cwd" "$US" "$cmd" "$US" "$tag" "$US" "$note"
+  done
+  return 0
+}
+
+cmd_status() {
+  local json=0 all=0
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --json) json=1; shift ;;
+      -a|--all) all=1; shift ;;
+      *) die "status: unknown option '$1'" ;;
+    esac
+  done
+  init_state
+  ctl_acquire; reap; ctl_release
+
+  local limit running queued
+  limit=$(get_limit)
+  ctl_acquire
+  running=$(count_state running)
+  queued=$(count_state queued)
+  ctl_release
+
+  if [ "$json" = 1 ]; then
+    printf '{"scope":"%s","dir":"%s","limit":%s,"running":%s,"queued":%s,"jobs":[' \
+      "$(json_escape "$SCOPE")" "$(json_escape "$SCOPE_DIR")" "$limit" "$running" "$queued"
+    local first=1 id st w r pid rc cwd cmd tag note
+    while IFS=$US read -r id st w r pid rc cwd cmd tag note; do
+      [ "$all" = 1 ] || [ "$st" != done ] || continue
+      [ "$first" = 1 ] || printf ','
+      first=0
+      printf '{"id":"%s","state":"%s","waited":%s,"ran":%s,"pid":%s,"exit":%s,"cwd":"%s","command":"%s","tag":"%s","note":"%s"}' \
+        "$id" "$st" "$w" "$r" "${pid:-null}" "${rc:-null}" \
+        "$(json_escape "$cwd")" "$(json_escape "$cmd")" \
+        "$(json_escape "$tag")" "$(json_escape "$note")"
+    done <<EOF
+$(status_rows)
+EOF
+    printf ']}\n'
+    return 0
+  fi
+
+  printf 'scope %s  limit %s  running %s  queued %s\n' "$SCOPE" "$limit" "$running" "$queued"
+  local rows id st w r pid rc cwd cmd tag note disp any=0
+  rows=$(status_rows)
+  [ -n "$rows" ] || { printf '(no jobs)\n'; return 0; }
+  printf '%-7s %-8s %7s %7s %7s  %s\n' ID STATE WAIT RUN PID COMMAND
+  while IFS=$US read -r id st w r pid rc cwd cmd tag note; do
+    [ -n "$id" ] || continue
+    [ "$all" = 1 ] || [ "$st" != done ] || continue
+    any=1
+    case $st in
+      done) st="done:${rc:-?}" ;;
+    esac
+    if [ "$r" -lt 0 ] 2>/dev/null; then disp="-"; else disp=$(hms "$r"); fi
+    printf '%-7s %-8s %7s %7s %7s  %s\n' \
+      "$id" "$st" "$(hms "$w")" "$disp" "${pid:--}" "${cmd:-?}"
+    [ -n "$note" ] && printf '%-7s %s\n' "" "  ^ $note"
+  done <<EOF
+$rows
+EOF
+  [ "$any" = 1 ] || printf '(nothing active; --all to include finished jobs)\n'
+  return 0
+}
+
+cmd_wait() {
+  init_state
+  local rc=0 id st
+  if [ $# -eq 0 ]; then
+    # Drain: block until nothing is queued or running.
+    local n
+    while :; do
+      ctl_acquire; reap
+      n=$(count_state running); n=$((n + $(count_state queued)))
+      ctl_release
+      [ "$n" -eq 0 ] && return 0
+      sleep 0.25
+    done
+  fi
+  for id in "$@"; do
+    [ -d "$JOBS_DIR/$id" ] || { warn "no such job: $id"; rc=1; continue; }
+    while :; do
+      ctl_acquire; reap; ctl_release
+      st=$(getf "$id" state)
+      [ "$st" = done ] && break
+      sleep 0.25
+    done
+    local e; e=$(getf "$id" exit)
+    case $e in ''|*[!0-9]*) e=1 ;; esac
+    [ "$e" -ne 0 ] && rc=$e
+  done
+  return "$rc"
+}
+
+cmd_logs() {
+  local follow=0
+  while [ $# -gt 0 ]; do
+    case $1 in -f|--follow) follow=1; shift ;; -*) die "logs: unknown option '$1'" ;; *) break ;; esac
+  done
+  local id=${1:-}
+  [ -n "$id" ] || die "logs: need a job id"
+  local f=$JOBS_DIR/$id/log
+  [ -d "$JOBS_DIR/$id" ] || die "no such job: $id"
+  if [ ! -f "$f" ]; then
+    die "job $id has no log (foreground jobs stream to their own terminal; use 'submit' for logged jobs)"
+  fi
+  if [ "$follow" = 1 ]; then tail -f "$f"; else cat "$f"; fi
+}
+
+cmd_cancel() {
+  init_state
+  [ $# -gt 0 ] || die "cancel: need a job id (or 'all')"
+  local id st pid child targets=""
+  if [ "${1:-}" = all ]; then
+    local d
+    for d in "$JOBS_DIR"/*/; do
+      [ -d "$d" ] || continue
+      rf "$d/state"
+      case $RF in queued|running) d=${d%/}; targets="$targets ${d##*/}" ;; esac
+    done
+  else
+    targets=$*
+  fi
+  for id in $targets; do
+    [ -d "$JOBS_DIR/$id" ] || { warn "no such job: $id"; continue; }
+    st=$(getf "$id" state)
+    [ "$st" = done ] && { warn "job $id already finished"; continue; }
+    : > "$JOBS_DIR/$id/cancel"
+    child=$(getf "$id" child)
+    pid=$(getf "$id" pid)
+    if [ "$st" = running ] && alive "$child"; then
+      kill -TERM "$child" 2>/dev/null
+    elif alive "$pid"; then
+      kill -TERM "$pid" 2>/dev/null
+    fi
+    printf 'cancelled %s\n' "$id"
+  done
+  return 0
+}
+
+cmd_limit() {
+  init_state
+  if [ $# -eq 0 ]; then get_limit; printf '\n'; return 0; fi
+  local n=$1
+  case $n in ''|*[!0-9]*) die "limit: want a positive integer, got '$n'" ;; esac
+  [ "$n" -ge 1 ] || die "limit: want a positive integer, got '$n'"
+  printf '%s\n' "$n" > "$SCOPE_DIR/limit" || die "cannot write $SCOPE_DIR/limit"
+  printf 'limit for scope %s is now %s\n' "$SCOPE" "$n"
+  [ -n "${LOCKOUT_LIMIT:-}" ] && warn "LOCKOUT_LIMIT=$LOCKOUT_LIMIT is set and overrides this for the current environment"
+  return 0
+}
+
+cmd_reap() {
+  init_state
+  ctl_acquire; reap; ctl_release
+  cmd_status
+}
+
+cmd_reset() {
+  init_state
+  [ "${1:-}" = --force ] || die "reset wipes all state for scope '$SCOPE'; pass --force"
+  local d
+  for d in "$JOBS_DIR"/*/; do
+    [ -d "$d" ] || continue
+    rf "$d/pid"
+    alive "$RF" && die "refusing to reset: job ${d} is still live (pid $RF). Cancel it first."
+  done
+  rm -rf "$SCOPE_DIR"
+  printf 'reset scope %s\n' "$SCOPE"
+}
+
+usage() {
+  cat <<'__HELP__'
+lockout - queue expensive builds so they do not fight over the machine.
+
+USAGE
+  lockout run [-t TAG] [-q] -- CMD [ARGS...]   queue, block, run, exit with CMD's code
+  lockout submit [-t TAG] -- CMD [ARGS...]     queue and detach; prints a job id
+  lockout status [--json] [--all]              what is running and what is waiting
+  lockout wait [ID...]                         block until ID (or everything) is done
+  lockout logs [-f] ID                         output of a submitted job
+  lockout cancel ID | all                      stop a queued or running job
+  lockout limit [N]                            show or set the concurrency limit
+  lockout reap                                 free slots from dead processes
+  lockout reset --force                        wipe this scope's state
+  lockout version | help
+
+ENVIRONMENT
+  LOCKOUT_LIMIT      concurrency limit, overrides the stored one (default 1)
+  LOCKOUT_SCOPE      queue name; separate scopes never block each other (default "default")
+  LOCKOUT_HOME       state directory (default $XDG_STATE_HOME/lockout or ~/.local/state/lockout)
+  LOCKOUT_RETENTION  seconds to keep finished jobs in status (default 3600)
+
+NOTES
+  Jobs are admitted first-come-first-served. A command run under lockout can
+  itself call lockout in the same scope without deadlocking -- the inner call
+  detects the held slot and runs inline.
+
+EXAMPLES
+  lockout run -- cargo build --release
+  lockout limit 2
+  id=$(lockout submit -q -- cargo test); lockout wait "$id"; lockout logs "$id"
+  watch -n1 lockout status
+__HELP__
+}
+
+# -------------------------------------------------------------- dispatch ----
+
+SELF=$(self_path)
+
+main() {
+  local sub=${1:-help}
+  [ $# -gt 0 ] && shift
+  case $sub in
+    run)        cmd_run "$@" ;;
+    submit)     cmd_submit "$@" ;;
+    __worker)   cmd_worker "$@" ;;
+    status|st)  cmd_status "$@" ;;
+    wait)       cmd_wait "$@" ;;
+    logs|log)   cmd_logs "$@" ;;
+    cancel|kill) cmd_cancel "$@" ;;
+    limit)      cmd_limit "$@" ;;
+    reap)       cmd_reap "$@" ;;
+    reset)      cmd_reset "$@" ;;
+    version|--version|-V) printf '%s %s\n' "$PROG" "$VERSION" ;;
+    help|--help|-h) usage ;;
+    *) printf '%s: unknown command '\''%s'\''\n\n' "$PROG" "$sub" >&2; usage >&2; exit 2 ;;
+  esac
+}
+
+main "$@"
