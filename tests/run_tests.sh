@@ -299,6 +299,92 @@ live=$("$LOCKOUT" status --json | grep -c '"id"')
 "$LOCKOUT" wait >/dev/null 2>&1
 check "$live" 1
 
+scope exclusive
+
+start "two jobs sharing a build dir never run at once"
+# Cargo locks its target dir, so admitting both only parks one on a lock while
+# it holds a slot. Limit 2 proves the constraint is the resource, not the count.
+"$LOCKOUT" limit 2 >/dev/null
+CARGO_TARGET_DIR=/tmp/lockout-excl-a "$LOCKOUT" submit -q -- sleep 1.5 >/dev/null
+sleep 0.3
+CARGO_TARGET_DIR=/tmp/lockout-excl-a "$LOCKOUT" submit -q -- sleep 0.2 >/dev/null
+sleep 0.3
+both=$("$LOCKOUT" status --json | grep -o '"state":"running"' | grep -c running)
+"$LOCKOUT" wait >/dev/null 2>&1
+check "$both" 1
+
+start "distinct build dirs still run in parallel"
+"$LOCKOUT" limit 2 >/dev/null
+CARGO_TARGET_DIR=/tmp/lockout-excl-b "$LOCKOUT" submit -q -- sleep 1.5 >/dev/null
+CARGO_TARGET_DIR=/tmp/lockout-excl-c "$LOCKOUT" submit -q -- sleep 1.5 >/dev/null
+sleep 0.5
+par=$("$LOCKOUT" status --json | grep -o '"state":"running"' | grep -c running)
+"$LOCKOUT" cancel all >/dev/null 2>&1
+"$LOCKOUT" wait >/dev/null 2>&1
+check "$par" 2
+
+start "a job blocked on a build dir says so"
+"$LOCKOUT" limit 2 >/dev/null
+CARGO_TARGET_DIR=/tmp/lockout-excl-d "$LOCKOUT" submit -q -- sleep 1.5 >/dev/null
+sleep 0.3
+CARGO_TARGET_DIR=/tmp/lockout-excl-d "$LOCKOUT" submit -q -- sleep 0.2 >/dev/null
+sleep 0.3
+said=$("$LOCKOUT" status --json | grep -o 'waiting on build dir' | wc -l | tr -d ' ')
+"$LOCKOUT" cancel all >/dev/null 2>&1
+"$LOCKOUT" wait >/dev/null 2>&1
+[ "$said" -ge 1 ] && ok || bad "expected a blocked job to explain its wait, got $said"
+
+start "a blocked resource does not stall unrelated jobs"
+# The head of the queue may be waiting on a directory it cannot have. Everything
+# behind it that needs a different directory must still start.
+"$LOCKOUT" limit 2 >/dev/null
+CARGO_TARGET_DIR=/tmp/lockout-excl-e "$LOCKOUT" submit -q -- sleep 1.5 >/dev/null
+sleep 0.2
+CARGO_TARGET_DIR=/tmp/lockout-excl-e "$LOCKOUT" submit -q -- sleep 0.2 >/dev/null
+CARGO_TARGET_DIR=/tmp/lockout-excl-f "$LOCKOUT" submit -q -- sleep 1.5 >/dev/null
+sleep 0.5
+running=$("$LOCKOUT" status --json | grep -o '"state":"running"' | grep -c running)
+"$LOCKOUT" cancel all >/dev/null 2>&1
+"$LOCKOUT" wait >/dev/null 2>&1
+check "$running" 2
+
+scope dedupe
+
+start "an identical queued job is collapsed rather than run twice"
+# Safe only because the twin has not started: it has read nothing, so whenever
+# it runs it sees the tree both callers asked about.
+"$LOCKOUT" limit 1 >/dev/null
+"$LOCKOUT" submit -q -- sleep 1.2 >/dev/null
+CARGO_TARGET_DIR=/tmp/lockout-dd "$LOCKOUT" submit -q -- true >/dev/null
+sleep 0.2
+CARGO_TARGET_DIR=/tmp/lockout-dd "$LOCKOUT" run -q -- true >/dev/null 2>&1
+made=$("$LOCKOUT" status --all --json | grep -o '"command":"true"' | wc -l | tr -d ' ')
+"$LOCKOUT" wait >/dev/null 2>&1
+check "$made" 1
+
+start "differing RUSTFLAGS are not the same job"
+# Identical command text, opposite verdicts on identical source. Collapsing
+# these would reintroduce exactly the bug this queue exists to prevent.
+"$LOCKOUT" limit 1 >/dev/null
+"$LOCKOUT" submit -q -- sleep 1.2 >/dev/null
+CARGO_TARGET_DIR=/tmp/lockout-dd2 "$LOCKOUT" submit -q -- echo lint >/dev/null
+sleep 0.2
+CARGO_TARGET_DIR=/tmp/lockout-dd2 RUSTFLAGS="-D warnings" "$LOCKOUT" submit -q -- echo lint >/dev/null
+kept=$("$LOCKOUT" status --all --json | grep -o '"command":"echo lint"' | wc -l | tr -d ' ')
+"$LOCKOUT" cancel all >/dev/null 2>&1
+"$LOCKOUT" wait >/dev/null 2>&1
+check "$kept" 2
+
+start "--no-dedupe forces a second run"
+"$LOCKOUT" limit 1 >/dev/null
+"$LOCKOUT" submit -q -- sleep 1.2 >/dev/null
+CARGO_TARGET_DIR=/tmp/lockout-dd3 "$LOCKOUT" submit -q -- echo forced >/dev/null
+sleep 0.2
+CARGO_TARGET_DIR=/tmp/lockout-dd3 "$LOCKOUT" run -q --no-dedupe -- echo forced >/dev/null 2>&1
+forced=$("$LOCKOUT" status --all --json | grep -o '"command":"echo forced"' | wc -l | tr -d ' ')
+"$LOCKOUT" wait >/dev/null 2>&1
+check "$forced" 2
+
 # ---------------------------------------------------------------------------
 
 echo

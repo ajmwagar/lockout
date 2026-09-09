@@ -1,3 +1,9 @@
 # lockout runtime state never belongs in the repo
 *.log
 .DS_Store
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/
