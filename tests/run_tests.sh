@@ -385,6 +385,43 @@ forced=$("$LOCKOUT" status --all --json | grep -o '"command":"echo forced"' | wc
 "$LOCKOUT" wait >/dev/null 2>&1
 check "$forced" 2
 
+scope where
+
+start "--path names the crate a job came from"
+# A column of absolute paths is mostly redundant prefix; the crate is what
+# identifies a job to a reader scanning the queue.
+crate=$(mktemp -d)
+printf '[package]\nname = "widget-forge"\nversion = "0.1.0"\n' > "$crate/Cargo.toml"
+"$LOCKOUT" limit 1 >/dev/null
+"$LOCKOUT" submit -q -- sleep 1.2 >/dev/null
+( cd "$crate" && "$LOCKOUT" submit -q -- echo hi >/dev/null )
+sleep 0.3
+named=$("$LOCKOUT" status --path | grep -c 'widget-forge')
+"$LOCKOUT" cancel all >/dev/null 2>&1
+"$LOCKOUT" wait >/dev/null 2>&1
+rm -rf "$crate"
+[ "$named" -ge 1 ] && ok || bad "expected the crate name in --path output"
+
+start "--path falls back to the directory when there is no crate"
+plain=$(mktemp -d)
+"$LOCKOUT" limit 1 >/dev/null
+"$LOCKOUT" submit -q -- sleep 1.2 >/dev/null
+( cd "$plain" && "$LOCKOUT" submit -q -- echo hi >/dev/null )
+sleep 0.3
+fell=$("$LOCKOUT" status --path | grep -c "$(basename "$plain")")
+"$LOCKOUT" cancel all >/dev/null 2>&1
+"$LOCKOUT" wait >/dev/null 2>&1
+rm -rf "$plain"
+[ "$fell" -ge 1 ] && ok || bad "expected the cwd when no Cargo.toml names a package"
+
+start "status without --path is unchanged"
+"$LOCKOUT" limit 1 >/dev/null
+"$LOCKOUT" submit -q -- sleep 0.8 >/dev/null
+sleep 0.2
+head=$("$LOCKOUT" status | sed -n '2p')
+"$LOCKOUT" wait >/dev/null 2>&1
+case $head in *WHERE*) bad "WHERE leaked into default output" ;; *) ok ;; esac
+
 # ---------------------------------------------------------------------------
 
 echo

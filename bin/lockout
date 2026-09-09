@@ -330,6 +330,34 @@ reap() {
 JOB_ID=""
 CHILD_PID=""
 
+# Where a job came from, preferring a crate name over a long path.
+#
+# A column of absolute paths is hard to scan and mostly redundant prefix; the
+# crate is what a reader actually wants to identify. Falls back to the path when
+# there is no package to name, so the column never goes blank.
+job_where() { # cwd -> stdout
+  local dir=$1 line in_package=0 name=""
+  [ -n "$dir" ] || { printf '-'; return 0; }
+  if [ -f "$dir/Cargo.toml" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      case $line in
+        '[package]'*)  in_package=1 ;;
+        '['*)          [ "$in_package" = 1 ] && break ;;
+        name*=*)
+          if [ "$in_package" = 1 ]; then
+            name=${line#*=}
+            name=${name#"${name%%[![:space:]]*}"}   # ltrim
+            name=${name%\"}; name=${name#\"}
+            break
+          fi ;;
+      esac
+    done < "$dir/Cargo.toml"
+  fi
+  [ -n "$name" ] && { printf '%s' "$name"; return 0; }
+  printf '%s' "$dir"
+  return 0
+}
+
 job_cmd_text() { # cmd... -> stdout (same quoting enqueue records)
   local a out=""
   for a in "$@"; do out="$out $(shquote "$a")"; done
@@ -634,11 +662,12 @@ status_rows() { # -> id US state US wait US run US pid US exit US cwd US cmd US 
 }
 
 cmd_status() {
-  local json=0 all=0
+  local json=0 all=0 showpath=0
   while [ $# -gt 0 ]; do
     case $1 in
       --json) json=1; shift ;;
       -a|--all) all=1; shift ;;
+      -p|--path) showpath=1; shift ;;
       *) die "status: unknown option '$1'" ;;
     esac
   done
@@ -679,7 +708,11 @@ EOF
   local rows id st w r pid rc cwd cmd tag note disp any=0
   rows=$(status_rows)
   [ -n "$rows" ] || { printf '(no jobs)\n'; return 0; }
-  printf '%-7s %-8s %7s %7s %7s  %s\n' ID STATE WAIT RUN PID COMMAND
+  if [ "$showpath" = 1 ]; then
+    printf '%-7s %-8s %7s %7s %7s  %-24s %s\n' ID STATE WAIT RUN PID WHERE COMMAND
+  else
+    printf '%-7s %-8s %7s %7s %7s  %s\n' ID STATE WAIT RUN PID COMMAND
+  fi
   while IFS=$US read -r id st w r pid rc cwd cmd tag note; do
     [ -n "$id" ] || continue
     [ "$all" = 1 ] || [ "$st" != "done" ] || continue
@@ -688,8 +721,13 @@ EOF
       done) st="done:${rc:-?}" ;;
     esac
     if [ "$r" -lt 0 ] 2>/dev/null; then disp="-"; else disp=$(hms "$r"); fi
-    printf '%-7s %-8s %7s %7s %7s  %s\n' \
-      "$id" "$st" "$(hms "$w")" "$disp" "${pid:--}" "${cmd:-?}"
+    if [ "$showpath" = 1 ]; then
+      printf '%-7s %-8s %7s %7s %7s  %-24s %s\n' \
+        "$id" "$st" "$(hms "$w")" "$disp" "${pid:--}" "$(job_where "$cwd")" "${cmd:-?}"
+    else
+      printf '%-7s %-8s %7s %7s %7s  %s\n' \
+        "$id" "$st" "$(hms "$w")" "$disp" "${pid:--}" "${cmd:-?}"
+    fi
     [ -n "$note" ] && printf '%-7s %s\n' "" "  ^ $note"
   done <<EOF
 $rows
@@ -811,7 +849,8 @@ lockout - queue expensive builds so they do not fight over the machine.
 USAGE
   lockout run [-t TAG] [-q] -- CMD [ARGS...]   queue, block, run, exit with CMD's code
   lockout submit [-t TAG] -- CMD [ARGS...]     queue and detach; prints a job id
-  lockout status [--json] [--all]              what is running and what is waiting
+  lockout status [--json] [--all] [--path]     what is running and what is waiting
+                                              --path adds a WHERE column: crate name, or cwd
   lockout wait [ID...]                         block until ID (or everything) is done
   lockout logs [-f] ID                         output of a submitted job
   lockout cancel ID | all                      stop a queued or running job
