@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+#
+# Transparent cargo shim: routes the expensive subcommands through lockout and
+# passes everything else straight to the real cargo.
+#
+# Put this directory FIRST on PATH:
+#     export PATH="/path/to/lockout/shim:$PATH"
+#
+# Anything that does not compile (`cargo add`, `cargo fmt`, `cargo metadata`)
+# is not worth queueing and goes straight through, so interactive work stays
+# responsive while a build holds the slot.
+
+set -uo pipefail
+
+SHIM_DIR=$(cd -P "$(dirname "$0")" >/dev/null 2>&1 && pwd)
+
+# The first cargo on PATH that is not this shim. Comparing resolved directories
+# rather than paths keeps a symlinked shim dir from shadowing itself forever.
+find_real_cargo() {
+  local oldifs=$IFS p rp c
+  IFS=:
+  for p in $PATH; do
+    IFS=$oldifs
+    [ -n "$p" ] || p=.
+    c=$p/cargo
+    if [ -x "$c" ] && [ ! -d "$c" ]; then
+      rp=$(cd -P "$p" >/dev/null 2>&1 && pwd) || rp=""
+      if [ "$rp" != "$SHIM_DIR" ]; then printf '%s' "$c"; return 0; fi
+    fi
+    IFS=:
+  done
+  IFS=$oldifs
+  return 1
+}
+
+REAL=${CARGO_REAL:-$(find_real_cargo)}
+if [ -z "$REAL" ]; then
+  printf 'cargo shim: no real cargo found on PATH (is %s the only one?)\n' "$SHIM_DIR" >&2
+  exit 127
+fi
+
+# Prefer the lockout next to this shim; fall back to whatever is on PATH.
+if [ -x "$SHIM_DIR/../bin/lockout" ]; then
+  LOCKOUT=$SHIM_DIR/../bin/lockout
+else
+  LOCKOUT=$(command -v lockout 2>/dev/null)
+fi
+[ -n "$LOCKOUT" ] || exec "$REAL" "$@"   # no lockout installed: never block work
+
+# The subcommand, looking past a +toolchain argument.
+sub=${1:-}
+case $sub in +*) sub=${2:-} ;; esac
+
+case $sub in
+  # Compiling subcommands: these are the ones that saturate the machine.
+  # `run` is deliberately absent -- it compiles and then runs your program,
+  # often for a long time, and holding a build slot for that is wrong.
+  build|b|test|t|check|c|clippy|bench|doc|rustc|nextest|miri)
+    exec "$LOCKOUT" run -t "cargo $sub" -- "$REAL" "$@"
+    ;;
+  *)
+    exec "$REAL" "$@"
+    ;;
+esac

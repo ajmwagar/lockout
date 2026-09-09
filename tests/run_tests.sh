@@ -16,9 +16,9 @@ TMP=$(mktemp -d "${TMPDIR:-/tmp}/lockout-test.XXXXXX") || exit 1
 export LOCKOUT_HOME=$TMP/state
 trap 'rm -rf "$TMP"' EXIT
 
-PASS=0; FAIL=0; CURRENT=""
+PASS=0; FAIL=0
 
-start() { CURRENT=$1; printf '  %-46s' "$1"; }
+start() { printf '  %-46s' "$1"; }
 ok()    { PASS=$((PASS + 1)); printf 'ok\n'; }
 bad()   { FAIL=$((FAIL + 1)); printf 'FAIL\n'; printf '      %s\n' "$*" >&2; }
 check() { if [ "$1" = "$2" ]; then ok; else bad "expected '$2', got '$1'"; fi; }
@@ -192,21 +192,33 @@ check "$r $q" "1 1"
 start "recorded command round-trips through the shell"
 "$LOCKOUT" wait >/dev/null 2>&1
 "$LOCKOUT" run -q -- printf '%s|' 'a b' "it's" '"dq"' '$notavar' >/dev/null 2>&1
-if command -v python3 >/dev/null 2>&1; then
-  recorded=$("$LOCKOUT" status --all --json \
-    | python3 -c 'import json,sys; print(json.load(sys.stdin)["jobs"][-1]["command"])')
-  # The whole point of the recorded command is that a human can paste it back.
-  check "$(eval "$recorded")" 'a b|it'"'"'s|"dq"|$notavar|'
-else
-  ok
-fi
+# The whole point of recording the command is that a human can paste it back.
+recorded=$("$LOCKOUT" status --all | tail -1 | sed 's/^ *[0-9]*  *[a-z:0-9?]*  *[0-9:]*  *[0-9:-]*  *[0-9-]*  *//')
+check "$(eval "$recorded")" 'a b|it'"'"'s|"dq"|$notavar|' 
 
-start "json parses as valid json"
-if command -v python3 >/dev/null 2>&1; then
-  "$LOCKOUT" status --all --json | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null && ok || bad "invalid json"
-else
-  ok
-fi
+# No JSON parser is assumed to exist, so check structurally: every key must
+# carry a value. A missing one shows up as ":," or ":}" and is exactly the
+# shape of the empty-jobs bug this catches.
+json_well_formed() {
+  case $1 in
+    '{'*'}') ;;
+    *) return 1 ;;
+  esac
+  case $1 in
+    *':,'*|*':}'*|*':]'*|*'[,'*) return 1 ;;
+  esac
+  return 0
+}
+
+start "json is well formed with jobs present"
+js=$("$LOCKOUT" status --all --json)
+json_well_formed "$js" && ok || bad "malformed: $js"
+
+start "json is well formed with no jobs at all"
+LOCKOUT_SCOPE=empty_scope "$LOCKOUT" reset --force >/dev/null 2>&1
+js=$(LOCKOUT_SCOPE=empty_scope "$LOCKOUT" status --all --json)
+if json_well_formed "$js" && [ "${js%\"jobs\":[]\}}" != "$js" ]; then ok
+else bad "expected an empty jobs array, got: $js"; fi
 
 # ------------------------------------------------------------- control -----
 
@@ -233,6 +245,16 @@ sleep 0.5
 "$LOCKOUT" wait >/dev/null 2>&1
 [ ! -f "$ran" ] && ok || bad "cancelled job still ran"
 
+start "cancel kills the whole process tree"
+# A build spawns compilers; killing only the direct child leaves them running.
+id=$("$LOCKOUT" submit -q -- sh -c 'sleep 47.1 & sleep 47.2')
+sleep 1
+"$LOCKOUT" cancel "$id" >/dev/null 2>&1
+sleep 1.5
+survivors=$(( $(pgrep -f 'sleep 47.1' 2>/dev/null | wc -l) + $(pgrep -f 'sleep 47.2' 2>/dev/null | wc -l) ))
+pkill -f 'sleep 47.1' 2>/dev/null; pkill -f 'sleep 47.2' 2>/dev/null
+check "$survivors" 0
+
 start "cancel terminates a running job"
 id=$("$LOCKOUT" submit -q -- sleep 30)
 sleep 0.8
@@ -258,11 +280,24 @@ q=$("$LOCKOUT" status --json | sed 's/.*"queued":\([0-9]*\).*/\1/')
 # ------------------------------------------------------------ retention ----
 
 scope retention
-start "prunes finished jobs past the retention window"
+start "keeps finished jobs inside the retention window"
 "$LOCKOUT" run -q -- true >/dev/null 2>&1
 before=$(LOCKOUT_RETENTION=3600 "$LOCKOUT" status --all --json | grep -c '"id"')
-after=$(LOCKOUT_RETENTION=0 "$LOCKOUT" reap >/dev/null 2>&1; "$LOCKOUT" status --all --json | grep -c '"id"')
 [ "$before" -ge 1 ] && ok || bad "expected a finished job to be listed, got $before"
+
+start "prunes finished jobs past the retention window"
+sleep 1.2   # retention is in whole seconds; the job must be measurably old
+LOCKOUT_RETENTION=0 "$LOCKOUT" reap >/dev/null 2>&1
+after=$(LOCKOUT_RETENTION=3600 "$LOCKOUT" status --all --json | grep -c '"id"')
+[ "$after" -lt "$before" ] && ok || bad "before=$before after=$after (nothing pruned)"
+
+start "retention never prunes a live job"
+"$LOCKOUT" submit -q -- sleep 1.5 >/dev/null
+sleep 0.4
+LOCKOUT_RETENTION=0 "$LOCKOUT" reap >/dev/null 2>&1
+live=$("$LOCKOUT" status --json | grep -c '"id"')
+"$LOCKOUT" wait >/dev/null 2>&1
+check "$live" 1
 
 # ---------------------------------------------------------------------------
 
