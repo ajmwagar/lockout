@@ -158,3 +158,7 @@ If an unrelated build already holds it, your queued build will print `Blocking
 waiting for file lock on package cache` *after* lockout admits it. That wait is
 cargo's, not lockout's — `lockout status` will show the job as running, because
 it is.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
