@@ -27,6 +27,120 @@ alive() { [ -n "${1:-}" ] && kill -0 "$1" 2>/dev/null; }
 RF=
 rf() { RF=""; [ -f "$1" ] || return 0; IFS= read -r RF < "$1" 2>/dev/null || :; return 0; }
 
+NL=$'\n'
+
+# The identity of a live process: the moment the kernel started it.
+#
+# A pid is not an identity, it is a number the kernel hands out again. Start
+# time is the part of a process that pid reuse cannot copy, and `ps` already has
+# to be on the box for kill_tree, so this costs no new dependency.
+#
+# Empty means "no process a job could still be running under", which covers the
+# case `kill -0` gets wrong: a zombie. A process killed while its parent never
+# wait()s stays in the table as <defunct> and answers kill -0 forever.
+#
+# Used only when recording a job, once. Checking uses the snapshot below.
+proc_ident() { # pid -> stdout token, empty when there is no usable process
+  local line st
+  [ -n "${1:-}" ] || return 0
+  line=$(ps -o state=,lstart= -p "$1" 2>/dev/null) || return 0
+  [ -n "$line" ] || return 0
+  st=${line%% *}
+  case $st in Z*) return 0 ;; esac      # <defunct>: the owner is already gone
+  line=${line#"$st"}
+  printf '%s' "${line// /}"
+  return 0
+}
+
+# One view of the process table, as "<pid>:<start time>" lines.
+#
+# Asking `ps` per job costs a fork per live job; one `ps` walked in awk, exactly
+# as kill_tree does, costs the same whether one job is live or twenty, and
+# leaves the per-job check forking nothing at all.
+#
+# Zombies are dropped here rather than matched: <defunct> still holds a pid, but
+# it is not running anybody's build.
+PROC_TABLE=$NL
+PROC_TRUST=0
+PROC_WARNED=0
+proc_snapshot() {
+  local t
+  t=$(ps -ax -o pid=,state=,lstart= 2>/dev/null | awk '
+    $2 !~ /^Z/ { s = ""; for (i = 3; i <= NF; i++) s = s $i; print $1 ":" s }')
+  PROC_TABLE=$NL$t$NL
+  # A snapshot that cannot see the process that took it is not a snapshot.
+  # Degrading to the old presence check is much better than the alternative
+  # failure mode -- declaring every live job abandoned because a tool is
+  # missing -- so say so once and carry on weaker.
+  case $PROC_TABLE in
+    *"$NL$$:"*) PROC_TRUST=1 ;;
+    *) PROC_TRUST=0
+       [ "$PROC_WARNED" = 1 ] || warn "ps cannot report the process table; falling back to pid-presence checks"
+       PROC_WARNED=1 ;;
+  esac
+  return 0
+}
+
+# Is a snapshot available for this reap pass?
+#
+# reap runs inside the control lock, so anything it forks is time every other
+# process spends queued behind it. A snapshot on every pass measurably delays
+# admission on a busy machine, and buys nothing: the check exists to notice a
+# slot held by a corpse, and noticing that within a few seconds rather than
+# instantly is indistinguishable in practice. So refresh on a schedule, and in
+# between fall back to the free presence test -- which can leave a corpse
+# holding its slot one more cycle, but can never reap a live job.
+#
+# A stale snapshot is never reused: it would not contain a job that started
+# since, and "not in the table" is how this code spells "dead".
+PROC_EVERY=5
+PROC_AT=-999      # $SECONDS of the last snapshot; per process, so a fresh
+PROC_PASS=0       # invocation (status, reap, a new job) always takes one
+proc_ready() {    # 0 when PROC_TABLE can be trusted for this pass
+  case $PROC_PASS in
+    1) return 0 ;;
+    2) return 1 ;;
+  esac
+  if [ $((SECONDS - PROC_AT)) -lt "$PROC_EVERY" ]; then PROC_PASS=2; return 1; fi
+  proc_snapshot
+  PROC_AT=$SECONDS
+  if [ "$PROC_TRUST" = 1 ]; then PROC_PASS=1; return 0; fi
+  PROC_PASS=2
+  return 1
+}
+
+# Is the process that owns a job still running it?
+#
+# `alive` answers a weaker question -- "does SOME process hold this pid" -- and
+# the queue's central promise (a dead agent cannot wedge the queue) rests on the
+# stronger one. Two ways the weak answer lies, both seen on a machine running
+# several agents:
+#
+#   - zombies: an agent harness torn down mid-build leaves the lockout wrapper
+#     killed but unreaped. kill -0 succeeds on <defunct> forever, so its slot is
+#     never freed and the queue wedges permanently.
+#   - pid reuse: a few parallel cargo builds burn the whole pid space in about
+#     twenty minutes, so a dead owner's number is handed to an unrelated process
+#     and its slot stays held for as long as that stranger happens to live.
+#
+# Records written by an older lockout carry no identity token; those keep the
+# old presence check rather than being reaped on a guess.
+owner_alive() { # pid token -> 0 when the owner is still running
+  local pid=${1:-} want=${2:-}
+  [ -n "$pid" ] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1   # builtin, free, and the usual answer
+  proc_ready || return 0                   # no identity to check against yet
+  case $PROC_TABLE in
+    *"$NL$pid:"*) : ;;
+    *) return 1 ;;                       # gone, or <defunct>
+  esac
+  [ -n "$want" ] || return 0             # legacy record: presence is all there is
+  case $PROC_TABLE in
+    *"$NL$pid:$want$NL"*) return 0 ;;
+  esac
+  return 1                               # the number was recycled onto a stranger
+}
+
 NO_DEDUPE=0
 EXCLUSIVE=""
 JOB_KEY=""
@@ -155,6 +269,29 @@ setf() { # id field value
 getf() { # id field  -> stdout
   local f=$JOBS_DIR/$1/$2
   [ -f "$f" ] && cat "$f" 2>/dev/null
+  return 0
+}
+
+# Record who owns a job: the pid, plus the identity the reaper verifies it
+# against. Pid and token live in one field on purpose -- written separately, a
+# reader could pair a freshly written pid with a stale token and reap a healthy
+# job. `pid` stays a bare number for status, cancel and every existing reader.
+set_owner() { # id pid
+  setf "$1" pid "$2"
+  setf "$1" owner "$2 $(proc_ident "$2")"
+  return 0
+}
+
+# Read a job's recorded owner into $OPID / $OTOK, in the style of rf/$RF.
+OPID=; OTOK=
+job_owner() { # job-dir
+  OPID=""; OTOK=""
+  rf "$1/owner"
+  case $RF in
+    '')    rf "$1/pid"; OPID=$RF ;;              # written by an older lockout
+    *' '*) OPID=${RF%% *}; OTOK=${RF#* } ;;
+    *)     OPID=$RF ;;
+  esac
   return 0
 }
 
@@ -291,20 +428,25 @@ queue_position() { # id -> stdout (1-based position among queued jobs)
 # Free slots held by processes that died, and prune old finished jobs so the
 # state dir does not grow without bound.
 reap() {
-  local d id st pid ended t
+  local d id st ended t
   t=$(now)
+  PROC_PASS=0         # at most one process-table snapshot per pass, on first use
   for d in "$JOBS_DIR"/*/; do
     [ -d "$d" ] || continue
     id=${d%/}; id=${id##*/}
     rf "$d/state"; st=$RF
     case $st in
       queued|running)
-        rf "$d/pid"; pid=$RF
-        if ! alive "$pid"; then
+        # owner_alive, not alive: a pid that still answers kill -0 may be a
+        # zombie or a stranger that inherited the number. Either one holds the
+        # slot for as long as it lives, which is the wedge this reaper exists
+        # to prevent.
+        job_owner "$d"
+        if ! owner_alive "$OPID" "$OTOK"; then
           setf "$id" state "done"
           setf "$id" exit 254
           setf "$id" ended "$t"
-          setf "$id" note "abandoned (pid ${pid:-?} vanished)"
+          setf "$id" note "abandoned (pid ${OPID:-?} vanished)"
         fi
         ;;
       done)
@@ -317,8 +459,8 @@ reap() {
       *)
         # A job dir with no state file is a half-built record from a crashed
         # enqueue; drop it once it is clearly not in flight.
-        rf "$d/pid"; pid=$RF
-        alive "$pid" || rm -rf "$d" 2>/dev/null
+        job_owner "$d"
+        owner_alive "$OPID" "$OTOK" || rm -rf "$d" 2>/dev/null
         ;;
     esac
   done
@@ -384,7 +526,9 @@ enqueue() { # mode tag cmd... -> stdout job id
   id=$(printf '%06d' "$n")
   d=$JOBS_DIR/$id
   mkdir -p "$d" || { ctl_release; die "cannot create job dir: $d"; }
-  setf "$id" pid "$$"
+  # $$ inside this command substitution is still the wrapper's own pid, which
+  # is the process whose death has to free the slot.
+  set_owner "$id" "$$"
   setf "$id" cmd "$cmd"
   setf "$id" cwd "$PWD"
   setf "$id" mode "$mode"
@@ -596,7 +740,7 @@ cmd_submit() {
   # abandoned before the worker takes over on the next line.
   nohup "$SELF" __worker "$id" "$@" >>"$JOBS_DIR/$id/log" 2>&1 &
   child=$!
-  setf "$id" pid "$child"
+  set_owner "$id" "$child"
   if [ "$QUIET" = 1 ]; then
     printf '%s\n' "$id"          # scriptable: bare id on stdout
   else
@@ -612,7 +756,9 @@ cmd_worker() {
   init_state
   JOB_ID=$id
   QUIET=1
-  setf "$id" pid "$$"
+  # Same pid the submitter recorded (nohup exec's, so the pid and its start
+  # time survive); rewriting it keeps the record right if submit died early.
+  set_owner "$id" "$$"
   trap on_exit EXIT
   trap 'on_signal INT 2' INT
   trap 'on_signal TERM 15' TERM

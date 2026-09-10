@@ -68,11 +68,17 @@ check "$?" 1
 
 # ---------------------------------------------------------- exclusion ------
 
+# Each job carries a distinct marker. Six byte-identical commands are dedupe
+# candidates, and collapsing them measures the deduplicator rather than the
+# semaphore: the count that comes back is then however many survived the
+# enqueue race, which on a loaded machine is anywhere from one to six. Real
+# builds contending for slots are not identical either. Dedupe has its own
+# tests further down.
 scope excl1
 start "limit 1 serialises concurrent jobs"
 trace=$TMP/trace1; : > "$trace"
 for i in 1 2 3 4; do
-  "$LOCKOUT" run -q -- sh -c "printf '+' >> '$trace'; sleep 0.4; printf -- '-' >> '$trace'" &
+  "$LOCKOUT" run -q -- sh -c "printf '+' >> '$trace'; sleep 0.4; printf -- '-' >> '$trace'; : job $i" &
 done
 wait
 check "$(max_concurrency "$trace")" 1
@@ -82,7 +88,7 @@ start "limit 3 admits exactly three at a time"
 "$LOCKOUT" limit 3 >/dev/null
 trace=$TMP/trace3; : > "$trace"
 for i in 1 2 3 4 5 6; do
-  "$LOCKOUT" run -q -- sh -c "printf '+' >> '$trace'; sleep 0.6; printf -- '-' >> '$trace'" &
+  "$LOCKOUT" run -q -- sh -c "printf '+' >> '$trace'; sleep 0.6; printf -- '-' >> '$trace'; : job $i" &
 done
 wait
 check "$(max_concurrency "$trace")" 3
@@ -127,6 +133,83 @@ pkill -f 'sleep 33.7' 2>/dev/null
 start "marks an abandoned job in status"
 out=$("$LOCKOUT" status --all 2>/dev/null | grep -c 'abandoned')
 [ "$out" -ge 1 ] && ok || bad "no abandoned note in status"
+
+# How long until a freshly submitted job finishes, or 'timeout'. Polls the job
+# record directly rather than calling status or wait: the claim under test is
+# that lockout reaps a dead owner on its own, so the test must not do any
+# reaping itself. A deadline, because a wedged queue has to fail the suite
+# rather than hang it.
+admitted_within() { # scope seconds -> seconds, or 'timeout'
+  local sc=$1 limit=$2 id t0
+  id=$("$LOCKOUT" submit -q -- true 2>/dev/null)
+  [ -n "$id" ] || { printf 'timeout'; return 0; }
+  t0=$SECONDS
+  while [ $((SECONDS - t0)) -lt "$limit" ]; do
+    if [ "$(cat "$LOCKOUT_HOME/$sc/jobs/$id/state" 2>/dev/null)" = done ]; then
+      printf '%s' $((SECONDS - t0)); return 0
+    fi
+    sleep 0.2
+  done
+  printf 'timeout'
+  return 0
+}
+
+scope zombieowner
+start "reclaims a slot whose owner is <defunct>"
+# An agent harness torn down mid-build leaves the lockout wrapper killed but
+# unreaped: its pid stays in the process table and `kill -0` answers "alive"
+# forever, so the slot is never freed and the queue wedges permanently. Presence
+# is not liveness. `exec` makes sleep the wrapper's parent, and sleep never
+# wait()s, which is what keeps the corpse in the table for the length of a test.
+zpid=$TMP/zombie-owner-pid; rm -f "$zpid"
+sh -c "'$LOCKOUT' run -q -- sleep 39.4 >/dev/null 2>&1 & echo \$! > '$zpid'; exec sleep 39.5" &
+guard=$!
+sleep 1.2
+victim=$(cat "$zpid" 2>/dev/null)
+kill -9 "$victim" 2>/dev/null
+sleep 0.4
+got=$(admitted_within zombieowner 10)
+kill -9 "$guard" 2>/dev/null
+pkill -f 'sleep 39.4' 2>/dev/null; pkill -f 'sleep 39.5' 2>/dev/null
+"$LOCKOUT" cancel all >/dev/null 2>&1
+[ "$got" != timeout ] && ok || bad "a <defunct> owner kept its slot; the queue never recovered"
+
+scope reusedpid
+start "does not mistake a recycled pid for the owner"
+# A few parallel builds burn the whole pid space in about twenty minutes, so a
+# dead owner's pid gets handed to an unrelated process and `kill -0` keeps
+# reporting the slot as busy for as long as that stranger lives. Pointing the
+# record at a live stranger is exactly what the kernel does on reuse; the
+# recorded identity, not the number, is what has to settle it.
+"$LOCKOUT" run -q -- sleep 40.6 >/dev/null 2>&1 &
+holder=$!
+sleep 1.5                       # the stranger must not share the owner's start second
+sleep 40.7 &
+stranger=$!
+kill -9 "$holder" 2>/dev/null
+sleep 0.4
+jd=$LOCKOUT_HOME/reusedpid/jobs/000001
+tok=""
+if [ -f "$jd/owner" ]; then tok=$(cat "$jd/owner"); tok=${tok#* }; fi
+printf '%s\n' "$stranger" > "$jd/pid"
+[ -n "$tok" ] && printf '%s %s\n' "$stranger" "$tok" > "$jd/owner"
+got=$(admitted_within reusedpid 10)
+kill -9 "$stranger" 2>/dev/null
+pkill -f 'sleep 40.6' 2>/dev/null
+"$LOCKOUT" cancel all >/dev/null 2>&1
+[ "$got" != timeout ] && ok || bad "a recycled pid kept the dead owner's slot held"
+
+scope nops
+start "degrades to presence when ps cannot answer"
+# Identity comes from ps. If ps cannot answer, the only safe direction to fail
+# is the old weaker check: declaring every live job abandoned because a tool is
+# missing would be far worse than the bug the identity check fixes.
+stub=$TMP/nops-bin; mkdir -p "$stub"
+printf '#!/bin/sh\nexit 1\n' > "$stub/ps"; chmod +x "$stub/ps"
+out=$(PATH="$stub:$PATH" "$LOCKOUT" run -q -- echo survived 2>/dev/null); rc=$?
+abandoned=$("$LOCKOUT" status --all 2>/dev/null | grep -c 'abandoned')
+[ "$rc" = 0 ] && [ "$out" = survived ] && [ "$abandoned" = 0 ] && ok \
+  || bad "rc=$rc out='$out' abandoned=$abandoned"
 
 scope stalelock
 start "reclaims a control lock left by a dead process"

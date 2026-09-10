@@ -107,9 +107,13 @@ filesystem.
   running count is below the limit. That is FIFO, and it means no job can be
   starved by a stream of newer arrivals.
 - **A dead agent cannot wedge the queue.** Every job records the pid that owns
-  it. Any process entering the critical section first reaps jobs whose owner no
-  longer exists, marking them `254` and freeing their slot. A control lock left
-  behind by a killed process is reclaimed the same way.
+  it *and that process's start time*. Any process entering the critical section
+  first reaps jobs whose owner no longer exists, marking them `254` and freeing
+  their slot. The start time is what makes that check honest: `kill -0` alone
+  reports an owner left `<defunct>` as alive forever, and a pid space that wraps
+  in minutes under a few parallel builds hands a dead owner's number to an
+  unrelated process. Neither impostor keeps a slot. A control lock left behind
+  by a killed process is reclaimed the same way.
 - **Re-entrancy.** A command running under lockout can call `lockout run` again
   in the same scope; the inner call sees the held slot in the environment and
   runs inline rather than deadlocking against its own parent. This is what makes
@@ -129,7 +133,7 @@ just ran, then are pruned.
 ## Tests
 
 ```bash
-./tests/run_tests.sh                            # 33 tests, ~30s
+./tests/run_tests.sh                            # 46 tests, ~80s
 LOCKOUT_BIN=/path/to/copy ./tests/run_tests.sh  # run against another bash
 ```
 
@@ -137,10 +141,11 @@ Plain bash, no framework, no interpreter beyond bash itself, throwaway state
 directory per run. Covers exclusion
 at limit 1 and limit 3 (by reconstructing the actual overlap from a trace each
 job writes), FIFO admission order, scope isolation, exit-code propagation,
-argument passing, re-entrancy, recovery from a killed holder and from a stale
-control lock, cancel of both queued and running jobs, signal handling, submit /
-wait / logs, retention pruning, and that `--json` stays well formed when the
-queue is empty.
+argument passing, re-entrancy, recovery from a killed holder, from an owner left
+`<defunct>`, from an owner pid recycled onto an unrelated process, and from a
+stale control lock, cancel of both queued and running jobs, signal handling,
+submit / wait / logs, retention pruning, and that `--json` stays well formed
+when the queue is empty.
 
 The suite passes on bash 3.2.57 and 5.3.9.
 
