@@ -39,6 +39,34 @@ if [ -z "$REAL" ]; then
   exit 127
 fi
 
+# Per-agent cargo home. Cargo's package-cache lock is per $CARGO_HOME, so
+# agents sharing one home serialize. The runtime (mush) sets BOB_AGENT_KEY;
+# when it is absent, fpl-bob derives a key from the worktree containing the
+# CWD. An explicit CARGO_HOME always wins, and a missing fpl-bob must never
+# break a build.
+if [ -z "${CARGO_HOME:-}" ] && [ -z "${BOB_NO_CARGO_HOME:-}" ]; then
+  if bob=$(command -v fpl-bob 2>/dev/null); then
+    if [ -n "${BOB_AGENT_KEY:-}" ]; then
+      bob_home=$("$bob" cargo-home --key "$BOB_AGENT_KEY" 2>/dev/null)
+    else
+      bob_home=$("$bob" cargo-home 2>/dev/null)
+    fi
+    [ -n "${bob_home:-}" ] && export CARGO_HOME=$bob_home
+  fi
+fi
+
+# Network filesystems cannot host cargo's target/. Ask bob where it goes.
+if [ -z "${CARGO_TARGET_DIR:-}" ] && [ -z "${BOB_NO_TARGET_DIR:-}" ]; then
+  if bob=$(command -v fpl-bob 2>/dev/null); then
+    target_dir=$("$bob" cargo-target 2>/dev/null)
+    if [ -n "$target_dir" ]; then
+      export CARGO_TARGET_DIR=$target_dir
+      mkdir -p "$CARGO_TARGET_DIR"
+      echo "bob: network workspace; CARGO_TARGET_DIR=$CARGO_TARGET_DIR" >&2
+    fi
+  fi
+fi
+
 # Prefer the lockout next to this shim; fall back to whatever is on PATH.
 if [ -x "$SHIM_DIR/../bin/lockout" ]; then
   LOCKOUT=$SHIM_DIR/../bin/lockout

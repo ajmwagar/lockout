@@ -1,6 +1,6 @@
 # lockout
 
-A mutex / job queue for expensive compilation.
+A mutex / job queue **and build budget** for expensive compilation.
 
 Several agents running `cargo build` at once do not finish sooner — they fight
 over the same cores and every one of them gets slower. `lockout` admits a set
@@ -70,8 +70,46 @@ lockout cancel "$id"
 
 `lockout run` exits with the wrapped command's own code, so a non-zero exit
 still means the build failed rather than the queue rejecting you. Its own
-failures are distinguishable: `130` cancelled, `143` SIGTERM, `254` the job's
-owner died and the slot was reclaimed.
+failures are distinguishable: `124` wall timeout, `125` children cap, `130`
+cancelled, `137` memory cap, `143` SIGTERM, `253` the kernel-task gate refused
+to spawn, `254` the job's owner died and the slot was reclaimed.
+
+### Build budget
+
+The queue decides *when* a job runs. The budget decides *what it may consume*
+while it runs. It is the same job record and the same state directory — there
+is no second limiter.
+
+```bash
+lockout run --cpu-quota 4 --mem-cap 8G --children 32 --timeout 30m -- cargo test
+lockout budget                      # show effective budget + kernel headroom
+lockout budget --cpu-quota 6 --children 48 --timeout 45m   # scope defaults
+lockout self-test                   # prove containment (about 7s)
+```
+
+| Flag | Meaning |
+|---|---|
+| `--cpu-quota N` | cores, decimals allowed (`2`, `0.5`); enforced by SIGSTOP/SIGCONT duty cycling |
+| `--mem-cap SIZE` | group RSS ceiling (`512M`, `2G`, or bytes) |
+| `--children N` | maximum descendant processes |
+| `--timeout D` | wall-clock cap (`90`, `30m`, `2h`) |
+| `--task-gate MODE` | `on` (default) refuses to spawn without kernel-task headroom; `warn` allows loudly; `off` disables |
+
+Before spawning, the budget compares the live process count (`pgrep`) with the
+tighter of `kern.num_tasks` and `kern.maxproc`. By default it refuses with
+`253` when headroom is smaller than `children + 64`; the detached worker for
+`submit` checks again after enqueue. A table that cannot be measured is treated
+as no headroom: the gate fails closed. `--task-gate warn` is the deliberate
+override, not the default.
+
+This matters on darwin because `ps -ax` can block for minutes on a loaded
+machine. `lockout` never walks the table: liveness is one `ps -p`, burn rate is
+one `ps -g`, and the task count is `pgrep` under a 3s cap.
+
+`lockout self-test` proves both modes: a forced ceiling refuses a spawn, and a
+loop that wants 20 seconds (8 CPU burners) is stopped by a 6s timeout after
+being held to a 2-core quota. It reports the measured CPU, peak group size, and
+survivor count.
 
 ### Scopes
 
@@ -91,6 +129,12 @@ LOCKOUT_SCOPE=docs lockout run -- cargo doc
 | `LOCKOUT_SCOPE` | `default` | Queue name |
 | `LOCKOUT_HOME` | `$XDG_STATE_HOME/lockout` or `~/.local/state/lockout` | State directory |
 | `LOCKOUT_RETENTION` | `3600` | Seconds to keep finished jobs in `status` |
+| `LOCKOUT_CPU_QUOTA` | `0` | Default CPU quota in cores (e.g. `2`, `0.5`) |
+| `LOCKOUT_MEM_CAP` | `0` | Default memory cap (e.g. `4G`) |
+| `LOCKOUT_CHILDREN` | `0` | Default descendant cap |
+| `LOCKOUT_TIMEOUT` | `0` | Default wall-clock cap |
+| `LOCKOUT_TASK_GATE` | `on` | `on` / `warn` / `off` |
+| `LOCKOUT_TASK_HEADROOM` | `64` | Kernel-task reserve required before a spawn |
 
 ## How it works
 
@@ -121,8 +165,14 @@ filesystem.
   will not hang.
 - **Cancelling stops the whole tree.** A build spawns compilers; signalling
   only the process lockout launched would leave those running, which is exactly
-  the CPU burn the queue exists to prevent. Cancel and SIGTERM walk the process
-  tree and signal leaves first.
+  the CPU burn the queue exists to prevent. Each job runs in its own process
+  group, so cancel and SIGTERM signal the group (no `ps -ax` walk).
+- **The budget is a sample loop, not a scheduler.** Once a second the supervisor
+  reads the job group's process count, RSS, and CPU time. Over the timeout,
+  memory cap, or children cap it stops the group; over the CPU quota it duty
+  cycles SIGSTOP/SIGCONT. Legacy jobs without a group are signalled at the root.
+- **The kernel-task gate fails closed.** If the table cannot be measured, no
+  spawn is admitted unless `--task-gate warn` or `off` is explicit.
 - **Polling backs off.** 50ms while a slot is likely to free up soon, then
   250ms, then 1s once it is clear the wait is long. Reads in the poll loop use
   bash builtins rather than `cat`, so waiting costs approximately nothing.
@@ -133,7 +183,8 @@ just ran, then are pruned.
 ## Tests
 
 ```bash
-./tests/run_tests.sh                            # 46 tests, ~80s
+./tests/run_tests.sh                            # 52 tests, ~2min
+./bin/lockout self-test                         # containment, ~7s
 LOCKOUT_BIN=/path/to/copy ./tests/run_tests.sh  # run against another bash
 ```
 
@@ -141,6 +192,8 @@ Plain bash, no framework, no interpreter beyond bash itself, throwaway state
 directory per run. Covers exclusion
 at limit 1 and limit 3 (by reconstructing the actual overlap from a trace each
 job writes), FIFO admission order, scope isolation, exit-code propagation,
+timeout / children / memory stops, budget persistence, the forced task-table
+gate, and the self-test,
 argument passing, re-entrancy, recovery from a killed holder, from an owner left
 `<defunct>`, from an owner pid recycled onto an unrelated process, and from a
 stale control lock, cancel of both queued and running jobs, signal handling,

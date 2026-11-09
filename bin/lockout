@@ -12,7 +12,7 @@
 
 set -uo pipefail
 
-VERSION=0.1.0
+VERSION=0.2.0
 PROG=lockout
 
 # ---------------------------------------------------------------- helpers ---
@@ -52,61 +52,26 @@ proc_ident() { # pid -> stdout token, empty when there is no usable process
   return 0
 }
 
-# One view of the process table, as "<pid>:<start time>" lines.
+# `ps -ax` walks the whole process table and can block for minutes on a loaded
+# machine. That is not hypothetical: on the Mac Studio this budget was written
+# for, `ps -ax -o pid=` timed out at 30s while `ps -p PID` and `pgrep -P 1`
+# answered instantly (docs/evidence/2026-10-22-baseline.md). A build budget must
+# never hang on the very condition it exists to prevent, so lockout never walks
+# the table: every liveness question is asked about one known pid, and every
+# burn-rate question about one known process group.
 #
-# Asking `ps` per job costs a fork per live job; one `ps` walked in awk, exactly
-# as kill_tree does, costs the same whether one job is live or twenty, and
-# leaves the per-job check forking nothing at all.
-#
-# Zombies are dropped here rather than matched: <defunct> still holds a pid, but
-# it is not running anybody's build.
-PROC_TABLE=$NL
-PROC_TRUST=0
-PROC_WARNED=0
-proc_snapshot() {
-  local t
-  t=$(ps -ax -o pid=,state=,lstart= 2>/dev/null | awk '
-    $2 !~ /^Z/ { s = ""; for (i = 3; i <= NF; i++) s = s $i; print $1 ":" s }')
-  PROC_TABLE=$NL$t$NL
-  # A snapshot that cannot see the process that took it is not a snapshot.
-  # Degrading to the old presence check is much better than the alternative
-  # failure mode -- declaring every live job abandoned because a tool is
-  # missing -- so say so once and carry on weaker.
-  case $PROC_TABLE in
-    *"$NL$$:"*) PROC_TRUST=1 ;;
-    *) PROC_TRUST=0
-       [ "$PROC_WARNED" = 1 ] || warn "ps cannot report the process table; falling back to pid-presence checks"
-       PROC_WARNED=1 ;;
-  esac
-  return 0
-}
-
-# Is a snapshot available for this reap pass?
-#
-# reap runs inside the control lock, so anything it forks is time every other
-# process spends queued behind it. A snapshot on every pass measurably delays
-# admission on a busy machine, and buys nothing: the check exists to notice a
-# slot held by a corpse, and noticing that within a few seconds rather than
-# instantly is indistinguishable in practice. So refresh on a schedule, and in
-# between fall back to the free presence test -- which can leave a corpse
-# holding its slot one more cycle, but can never reap a live job.
-#
-# A stale snapshot is never reused: it would not contain a job that started
-# since, and "not in the table" is how this code spells "dead".
-PROC_EVERY=5
-PROC_AT=-999      # $SECONDS of the last snapshot; per process, so a fresh
-PROC_PASS=0       # invocation (status, reap, a new job) always takes one
-proc_ready() {    # 0 when PROC_TABLE can be trusted for this pass
-  case $PROC_PASS in
-    1) return 0 ;;
-    2) return 1 ;;
-  esac
-  if [ $((SECONDS - PROC_AT)) -lt "$PROC_EVERY" ]; then PROC_PASS=2; return 1; fi
-  proc_snapshot
-  PROC_AT=$SECONDS
-  if [ "$PROC_TRUST" = 1 ]; then PROC_PASS=1; return 0; fi
-  PROC_PASS=2
-  return 1
+# One probe decides whether `ps` is usable at all. If it is not, degrade to the
+# old weaker presence check rather than declaring every live job abandoned.
+PS_OK=-1
+ps_works() { # 0 when per-pid ps answers
+  [ "$PS_OK" -ge 0 ] && return "$PS_OK"
+  if [ -n "$(ps -p $$ -o pid= 2>/dev/null)" ]; then
+    PS_OK=0
+  else
+    PS_OK=1
+    warn "ps cannot report process state; falling back to pid-presence checks"
+  fi
+  return "$PS_OK"
 }
 
 # Is the process that owns a job still running it?
@@ -126,19 +91,15 @@ proc_ready() {    # 0 when PROC_TABLE can be trusted for this pass
 # Records written by an older lockout carry no identity token; those keep the
 # old presence check rather than being reaped on a guess.
 owner_alive() { # pid token -> 0 when the owner is still running
-  local pid=${1:-} want=${2:-}
+  local pid=${1:-} want=${2:-} cur
   [ -n "$pid" ] || return 1
   kill -0 "$pid" 2>/dev/null || return 1   # builtin, free, and the usual answer
-  proc_ready || return 0                   # no identity to check against yet
-  case $PROC_TABLE in
-    *"$NL$pid:"*) : ;;
-    *) return 1 ;;                       # gone, or <defunct>
-  esac
-  [ -n "$want" ] || return 0             # legacy record: presence is all there is
-  case $PROC_TABLE in
-    *"$NL$pid:$want$NL"*) return 0 ;;
-  esac
-  return 1                               # the number was recycled onto a stranger
+  ps_works || return 0                     # no identity to check against
+  cur=$(proc_ident "$pid")
+  [ -n "$cur" ] || return 1                # gone, or <defunct>
+  [ -n "$want" ] || return 0               # legacy record: presence is all there is
+  [ "$cur" = "$want" ] && return 0
+  return 1                                 # the number was recycled onto a stranger
 }
 
 NO_DEDUPE=0
@@ -304,6 +265,204 @@ get_limit() {
   printf '%s' "$n"
 }
 
+# ------------------------------------------------------- build budget ------
+#
+# The queue above answers "how many builds at once". The budget answers the two
+# questions that actually took the machine down: how many kernel tasks are left,
+# and how much CPU / memory / process fan-out / wall time may one job consume.
+# It is the same artefact and the same job record -- not a second limiter.
+#
+# Values are stored in integer units so bash 3.2 arithmetic is exact:
+#   cpu_quota  millicpus (2000 = two cores; 500 = half a core)
+#   mem_cap    bytes
+#   children   maximum descendants (0 = unlimited)
+#   timeout    seconds (0 = none)
+
+B_CPU=0; B_MEM=0; B_CHILDREN=0; B_TIMEOUT=0; B_TASK_GATE=${LOCKOUT_TASK_GATE:-on}
+TASK_REASON=""
+
+cpu_milli() { # "2" | "0.5" -> millicpus
+  local v=${1:-} a b
+  case $v in
+    ''|*[!0-9.]*|*.*.*) die "invalid cpu quota: '$v' (want e.g. 2 or 0.5)" ;;
+  esac
+  case $v in
+    *.*) a=${v%%.*}; b=${v#*.}; b="${b}000"; b=${b:0:3} ;;
+    *)   a=$v; b=000 ;;
+  esac
+  [ -n "$a" ] || a=0
+  printf '%s' $((10#$a * 1000 + 10#$b))
+}
+
+mem_bytes() { # 512M | 2G | 1048576 -> bytes
+  local v=${1:-} n mul=1
+  case $v in
+    *[Kk]) n=${v%?}; mul=1024 ;;
+    *[Mm]) n=${v%?}; mul=1048576 ;;
+    *[Gg]) n=${v%?}; mul=1073741824 ;;
+    *)     n=$v ;;
+  esac
+  case $n in ''|*[!0-9]*) die "invalid mem cap: '$v' (want e.g. 512M, 2G or bytes)" ;; esac
+  printf '%s' $((10#$n * mul))
+}
+
+time_secs() { # 30 | 90s | 30m | 2h -> seconds
+  local v=${1:-} n mul=1
+  case $v in
+    *[Ss]) n=${v%?}; mul=1 ;;
+    *[Mm]) n=${v%?}; mul=60 ;;
+    *[Hh]) n=${v%?}; mul=3600 ;;
+    *)     n=$v ;;
+  esac
+  case $n in ''|*[!0-9]*) die "invalid timeout: '$v' (want e.g. 90, 30m or 2h)" ;; esac
+  printf '%s' $((10#$n * mul))
+}
+
+load_budget_defaults() { # env (human units) > scope files (canonical) > none
+  local v
+  # The scope files store canonical units: millicpus, bytes, seconds. Env vars
+  # accept human units. Mixing the two here is how "2 cores" becomes 2000 cores.
+  if [ -n "${LOCKOUT_CPU_QUOTA:-}" ]; then
+    B_CPU=$(cpu_milli "$LOCKOUT_CPU_QUOTA")
+  else
+    rf "$SCOPE_DIR/cpu_quota"; v=$RF
+    case ${v:-0} in ''|*[!0-9]*) die "invalid stored cpu quota: '$v'" ;; esac
+    B_CPU=$((10#${v:-0}))
+  fi
+  if [ -n "${LOCKOUT_MEM_CAP:-}" ]; then
+    B_MEM=$(mem_bytes "$LOCKOUT_MEM_CAP")
+  else
+    rf "$SCOPE_DIR/mem_cap"; v=$RF
+    case ${v:-0} in ''|*[!0-9]*) die "invalid stored mem cap: '$v'" ;; esac
+    B_MEM=$((10#${v:-0}))
+  fi
+  v=${LOCKOUT_CHILDREN:-}; [ -n "$v" ] || { rf "$SCOPE_DIR/children"; v=$RF; }
+  case ${v:-0} in ''|*[!0-9]*) die "invalid children cap: '$v'" ;; esac
+  B_CHILDREN=$((10#${v:-0}))
+  if [ -n "${LOCKOUT_TIMEOUT:-}" ]; then
+    B_TIMEOUT=$(time_secs "$LOCKOUT_TIMEOUT")
+  else
+    rf "$SCOPE_DIR/timeout"; v=$RF
+    case ${v:-0} in ''|*[!0-9]*) die "invalid stored timeout: '$v'" ;; esac
+    B_TIMEOUT=$((10#${v:-0}))
+  fi
+  v=${LOCKOUT_TASK_GATE:-}; [ -n "$v" ] || { rf "$SCOPE_DIR/task_gate"; v=$RF; }
+  B_TASK_GATE=${v:-on}
+  case $B_TASK_GATE in on|warn|off) : ;; *) die "invalid task gate: '$B_TASK_GATE' (on|warn|off)" ;; esac
+}
+
+budget_flag() { # option value -> sets B_*
+  case $1 in
+    --cpu-quota) B_CPU=$(cpu_milli "$2") ;;
+    --mem-cap)   B_MEM=$(mem_bytes "$2") ;;
+    --children)  case ${2:-} in ''|*[!0-9]*) die "invalid children cap: '$2'" ;; esac
+                 B_CHILDREN=$((10#$2)) ;;
+    --timeout)   B_TIMEOUT=$(time_secs "$2") ;;
+    --task-gate) case ${2:-} in on|warn|off) B_TASK_GATE=$2 ;; *) die "invalid task gate: '$2' (on|warn|off)" ;; esac ;;
+    *) return 1 ;;
+  esac
+  return 0
+}
+
+job_budget() { # id -> load the job's frozen budget into B_*
+  rf "$JOBS_DIR/$1/cpu_quota"; B_CPU=${RF:-0}
+  rf "$JOBS_DIR/$1/mem_cap";   B_MEM=${RF:-0}
+  rf "$JOBS_DIR/$1/children";  B_CHILDREN=${RF:-0}
+  rf "$JOBS_DIR/$1/timeout";   B_TIMEOUT=${RF:-0}
+  rf "$JOBS_DIR/$1/task_gate"; B_TASK_GATE=${RF:-on}
+  return 0
+}
+
+# How many kernel tasks are in use?
+#
+# Never `ps`: it is the tool that hangs when the table is under pressure. pgrep
+# reads the same table but has been observed to answer while ps blocks. A count
+# that cannot be measured is not headroom -- the gate fails closed.
+# Run a command with a hard wall cap, capturing stdout. No `timeout(1)` on macOS.
+run_capped() { # seconds outfile cmd...
+  local secs=$1 out=$2 p i=0 max; shift 2
+  max=$((secs * 10))
+  ( "$@" >"$out" 2>/dev/null ) & p=$!
+  while kill -0 "$p" 2>/dev/null; do
+    if [ "$i" -ge "$max" ]; then
+      kill -9 "$p" 2>/dev/null
+      return 124
+    fi
+    sleep 0.1; i=$((i + 1))
+  done
+  wait "$p" 2>/dev/null; return $?
+}
+
+task_count() {
+  local out tf rc at n t now
+  if [ -n "${LOCKOUT_TASK_COUNT:-}" ]; then
+    case $LOCKOUT_TASK_COUNT in ''|*[!0-9]*) return 1 ;; esac
+    printf '%s' "$LOCKOUT_TASK_COUNT"; return 0
+  fi
+  # A submit must not pay for a 1600-process scan every time. A short cached
+  # count keeps admission fast while still noticing a filling table within the
+  # TTL; the 64-task reserve absorbs the staleness.
+  t=${LOCKOUT_TASK_CACHE_TTL:-5}
+  case $t in ''|*[!0-9]*) t=5 ;; esac
+  now=$(now)
+  rf "$HOME_DIR/task_count_at"; at=$RF
+  rf "$HOME_DIR/task_count";    n=$RF
+  case ${at:-x} in *[!0-9]*) at=0 ;; esac
+  case ${n:-x}  in ''|*[!0-9]*) n=0 ;; esac
+  if [ "$n" -gt 0 ] && [ $((now - at)) -lt "$t" ]; then
+    printf '%s' "$n"; return 0
+  fi
+  tf=$(mktemp "${TMPDIR:-/tmp}/lockout-tasks.XXXXXX") || return 1
+  run_capped 3 "$tf" pgrep .; rc=$?
+  out=$(wc -l < "$tf" | tr -d ' '); rm -f "$tf"
+  [ "$rc" = 0 ] || return 1
+  case $out in ''|*[!0-9]*|0) return 1 ;; esac
+  printf '%s\n' "$out" > "$HOME_DIR/task_count" 2>/dev/null
+  printf '%s\n' "$now" > "$HOME_DIR/task_count_at" 2>/dev/null
+  printf '%s' "$out"
+}
+
+task_ceiling() { # the tighter of the kernel's two advertised ceilings
+  local a b
+  if [ -n "${LOCKOUT_TASK_CEILING:-}" ]; then
+    case $LOCKOUT_TASK_CEILING in ''|*[!0-9]*) return 1 ;; esac
+    printf '%s' "$LOCKOUT_TASK_CEILING"; return 0
+  fi
+  a=$(sysctl -n kern.num_tasks 2>/dev/null)
+  b=$(sysctl -n kern.maxproc 2>/dev/null)
+  case $a in ''|*[!0-9]*) a=0 ;; esac
+  case $b in ''|*[!0-9]*) b=0 ;; esac
+  [ "$a" -gt 0 ] || a=$b
+  [ "$b" -gt 0 ] || b=$a
+  [ "$a" -gt 0 ] || return 1
+  [ "$a" -lt "$b" ] && { printf '%s' "$a"; return 0; }
+  printf '%s' "$b"
+}
+
+task_headroom() { # stdout headroom, or empty when unmeasurable
+  local n c
+  n=$(task_count) || return 1
+  c=$(task_ceiling) || return 1
+  printf '%s' $((c - n))
+}
+
+task_gate_check() { # requested-children -> 0 when there is room to spawn
+  local want=${1:-0} head need reserve
+  reserve=${LOCKOUT_TASK_HEADROOM:-64}
+  case $reserve in ''|*[!0-9]*) reserve=64 ;; esac
+  TASK_REASON=""
+  head=$(task_headroom) || {
+    TASK_REASON="kernel task table unmeasurable (ps/pgrep blocked)"
+    return 1
+  }
+  need=$((want + reserve))
+  if [ "$head" -lt "$need" ]; then
+    TASK_REASON="kernel task table headroom ${head} < ${need} (children ${want} + reserve ${reserve})"
+    return 1
+  fi
+  return 0
+}
+
 # Resolve the build output directory a command will contend on.
 #
 # Cargo takes an exclusive lock on its target directory, so two jobs sharing one
@@ -430,7 +589,6 @@ queue_position() { # id -> stdout (1-based position among queued jobs)
 reap() {
   local d id st ended t
   t=$(now)
-  PROC_PASS=0         # at most one process-table snapshot per pass, on first use
   for d in "$JOBS_DIR"/*/; do
     [ -d "$d" ] || continue
     id=${d%/}; id=${id##*/}
@@ -518,7 +676,6 @@ enqueue() { # mode tag cmd... -> stdout job id
   JOB_KEY=$(job_key "$EXCLUSIVE" "$cmd")
 
   ctl_acquire
-  reap
   rf "$SCOPE_DIR/seq"; n=$RF
   case $n in ''|*[!0-9]*) n=0 ;; esac
   n=$((n + 1))
@@ -535,6 +692,11 @@ enqueue() { # mode tag cmd... -> stdout job id
   setf "$id" tag "$tag"
   setf "$id" exclusive "$EXCLUSIVE"
   setf "$id" key "$JOB_KEY"
+  setf "$id" cpu_quota "$B_CPU"
+  setf "$id" mem_cap "$B_MEM"
+  setf "$id" children "$B_CHILDREN"
+  setf "$id" timeout "$B_TIMEOUT"
+  setf "$id" task_gate "$B_TASK_GATE"
   setf "$id" queued_at "$(now)"
   setf "$id" state queued          # written last: the record is now live
   ctl_release
@@ -552,8 +714,14 @@ acquire_slot() { # id
     fi
 
     ctl_acquire
-    if [ $((SECONDS - last_reap)) -ge 2 ]; then reap; last_reap=$SECONDS; fi
     limit=$(get_limit)
+    # Reaping walks every job's owner. Do it when the queue is actually full
+    # (the only time a dead owner blocks work) rather than on the admission path
+    # of every new job -- otherwise short jobs serialise behind ps calls.
+    if [ $((SECONDS - last_reap)) -ge 2 ]; then
+      if [ "$(count_state running)" -ge "$limit" ]; then reap; fi
+      last_reap=$SECONDS
+    fi
     running=$(count_state running)
     head=$(oldest_queued)
     rf "$JOBS_DIR/$id/exclusive"; res=$RF
@@ -584,31 +752,63 @@ acquire_slot() { # id
   done
 }
 
-# Signal a process and everything it spawned, leaves first. Killing only the
-# recorded child is not enough: TERM to `cargo build` (or to any `sh -c`
-# wrapper) does not necessarily reach the rustc processes underneath it, and a
-# cancelled build that keeps eating cores defeats the whole point. One ps call,
-# walked in awk, so this stays cheap and works the same on macOS and Linux.
+# Signal a process and everything it spawned. Killing only the recorded child is
+# not enough: TERM to `cargo build` (or to any `sh -c` wrapper) does not
+# necessarily reach the rustc processes underneath it, and a cancelled build
+# that keeps eating cores defeats the whole point.
+#
+# Every budgeted job runs in its own process group (`set -m` below), so one
+# group signal reaches the whole tree without walking the process table -- the
+# walk that hangs under load. Legacy jobs started before 0.2.0 fall back to
+# signalling the root only, never the caller's own group.
 kill_tree() { # root-pid signal
-  local root=${1:-} sig=${2:-TERM} pids p
+  local root=${1:-} sig=${2:-TERM} pgid mine
   [ -n "$root" ] || return 0
-  pids=$(ps -o pid= -o ppid= -ax 2>/dev/null | awk -v root="$root" '
-    { pid[NR]=$1; par[$1]=$2; n=NR }
-    END {
-      want[root] = 1; out[1] = root; c = 1; changed = 1
-      while (changed) {
-        changed = 0
-        for (i = 1; i <= n; i++) {
-          q = pid[i]
-          if (!(q in want) && (par[q] in want)) { want[q] = 1; out[++c] = q; changed = 1 }
-        }
-      }
-      for (i = c; i >= 1; i--) print out[i]
-    }')
-  for p in $pids; do
-    [ "$p" = "$$" ] && continue      # never signal ourselves
-    kill -"$sig" "$p" 2>/dev/null
-  done
+  mine=$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')
+  pgid=$(ps -o pgid= -p "$root" 2>/dev/null | tr -d ' ')
+  case $pgid in
+    ''|*[!0-9]*) pgid="" ;;
+  esac
+  if [ -n "$pgid" ] && [ "$pgid" != "$mine" ] && [ "$pgid" != "$$" ]; then
+    kill -"$sig" -- "-$pgid" 2>/dev/null   # leaves first is the kernel's job
+    return 0
+  fi
+  [ "$root" = "$$" ] && return 0
+  kill -"$sig" "$root" 2>/dev/null
+  return 0
+}
+
+# One process-group snapshot: "count rss_kb cpu_ticks" (ticks = centiseconds).
+# ps -g only touches the named group, so it sidesteps the full-table walk.
+group_stats() { # pgid -> stdout
+  local out
+  out=$(ps -g "$1" -o pid=,rss=,time= 2>/dev/null) || { printf '0 0 0'; return 0; }
+  printf '%s\n' "$out" | awk '
+    function ticks(t,   a,n,c) {
+      n=split(t,a,":");
+      if (n==3) { split(a[3],c,"."); return (a[1]*3600+a[2]*60+c[1])*100 + (length(c[2])==1 ? c[2]*10 : c[2]+0) }
+      split(a[2],c,"."); return (a[1]*60+c[1])*100 + (length(c[2])==1 ? c[2]*10 : c[2]+0)
+    }
+    NF { n++; rss+=$2; cpu+=ticks($3) }
+    END { printf "%d %d %d\n", n, rss, cpu }'
+}
+
+# Duty-cycle a group that is burning more than its quota. SIGSTOP/SIGCONT is the
+# only portable CPU cap on macOS (no cgroups); stopping for the overshoot
+# fraction of the window drives the average back to the quota.
+throttle_group() { # pgid observed_millicpus quota_millicpus [remaining_ms]
+  local pgid=$1 rate=$2 quota=$3 remain=${4:-0} stop_ms
+  [ "$rate" -gt 0 ] && [ "$quota" -gt 0 ] || return 0
+  # The window just ran for one second at `rate`. To make the average `quota`
+  # over (1s + stop), stop for (rate-quota)/quota seconds -- not /rate, which
+  # under-throttles badly when a build fans out to every core.
+  stop_ms=$((1000 * (rate - quota) / quota))
+  [ "$stop_ms" -gt 5000 ] && stop_ms=5000
+  if [ "$remain" -gt 0 ] && [ "$stop_ms" -gt "$remain" ]; then stop_ms=$remain; fi
+  [ "$stop_ms" -ge 50 ] || return 0
+  kill -STOP -- "-$pgid" 2>/dev/null || return 0
+  sleep "$(printf '%d.%03d' $((stop_ms / 1000)) $((stop_ms % 1000)))"
+  kill -CONT -- "-$pgid" 2>/dev/null
   return 0
 }
 
@@ -648,15 +848,79 @@ on_signal() { # signame signum
   exit $((128 + num))
 }
 
+# Supervise one running job against its frozen budget. The child is in its own
+# process group, so CPU, RSS and fan-out are measured without a table walk.
+# Returns the job's exit code, or the budget's code when it had to stop it:
+#   124 timeout   125 too many children   137 memory cap
+supervise() { # id pid
+  local id=$1 pid=$2 pgid rc=0 note="" killed=0
+  local start last now elapsed d_wall count rss cpu d_cpu rate
+  local peak=0 total_cpu=0
+  pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')
+  case $pgid in ''|*[!0-9]*) pgid="" ;; esac
+  start=$(now); last=$start
+  read -r count rss cpu <<EOF
+$(group_stats "${pgid:-$pid}")
+EOF
+  last_cpu=${cpu:-0}
+  while kill -0 "$pid" 2>/dev/null; do
+    sleep 1
+    now=$(now); elapsed=$((now - start)); d_wall=$((now - last))
+    [ "$d_wall" -ge 1 ] || d_wall=1
+    read -r count rss cpu <<EOF
+$(group_stats "${pgid:-$pid}")
+EOF
+    case $count in ''|*[!0-9]*) count=0 ;; esac
+    [ "$count" -gt "$peak" ] && peak=$count
+    d_cpu=$((cpu - ${last_cpu:-0})); [ "$d_cpu" -lt 0 ] && d_cpu=0
+    total_cpu=$((total_cpu + d_cpu * 10))       # milliseconds
+    rate=$((d_cpu * 10 / d_wall))                # millicpus
+    last_cpu=$cpu; last=$now
+
+    if [ "$B_TIMEOUT" -gt 0 ] && [ "$elapsed" -ge "$B_TIMEOUT" ]; then
+      note="timeout after ${elapsed}s (cap ${B_TIMEOUT}s)"; rc=124; killed=1; break
+    fi
+    if [ "$B_MEM" -gt 0 ] && [ $((rss * 1024)) -gt "$B_MEM" ]; then
+      note="memory cap exceeded: $((rss / 1024)) MiB > $((B_MEM / 1048576)) MiB"; rc=137; killed=1; break
+    fi
+    if [ "$B_CHILDREN" -gt 0 ] && [ "$count" -gt $((B_CHILDREN + 1)) ]; then
+      note="children cap exceeded: $((count - 1)) > ${B_CHILDREN}"; rc=125; killed=1; break
+    fi
+    if [ "$B_CPU" -gt 0 ] && [ "$rate" -gt $((B_CPU * 13 / 10)) ]; then
+      local remain=0
+      [ "$B_TIMEOUT" -gt 0 ] && remain=$(( (B_TIMEOUT - elapsed - 1) * 1000 ))
+      throttle_group "${pgid:-$pid}" "$rate" "$B_CPU" "$remain"
+    fi
+  done
+  if [ "$killed" = 1 ]; then
+    kill_tree "$pid" TERM
+    local i=0
+    while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 20 ]; do sleep 0.1; i=$((i+1)); done
+    kill -0 "$pid" 2>/dev/null && kill_tree "$pid" KILL
+  fi
+  local wrc=0
+  wait "$pid" 2>/dev/null; wrc=$?
+  [ "$killed" = 1 ] || rc=$wrc
+  setf "$id" peak_children "$peak"
+  setf "$id" cpu_ms "$total_cpu"
+  [ -n "$note" ] && setf "$id" note "$note"
+  return "$rc"
+}
+
 # Run the command with the slot held. Assumes acquire_slot already returned 0.
 exec_job() { # id cmd...
   local id=$1 rc=0; shift
   export LOCKOUT_JOB=$id
   export LOCKOUT_ACTIVE_SCOPE=$SCOPE
+  job_budget "$id"
+  # Job control (not a ps walk) gives the command its own process group, so the
+  # supervisor and cancel can signal and measure the whole tree with one id.
+  set -m
   "$@" &
   CHILD_PID=$!
+  set +m
   setf "$id" child "$CHILD_PID"
-  wait "$CHILD_PID"; rc=$?
+  supervise "$id" "$CHILD_PID" || rc=$?
   CHILD_PID=""
   finish "$id" "$rc"
   JOB_ID=""
@@ -675,11 +939,16 @@ QUIET=0
 
 cmd_run() {
   local tag=""
+  init_state
+  load_budget_defaults
   while [ $# -gt 0 ]; do
     case $1 in
       -q|--quiet)   QUIET=1; shift ;;
       -t|--tag)     tag=${2:-}; shift 2 ;;
       --no-dedupe)  NO_DEDUPE=1; shift ;;
+      --cpu-quota|--mem-cap|--children|--timeout|--task-gate)
+                    [ $# -ge 2 ] || die "run: $1 needs a value"
+                    budget_flag "$1" "$2"; shift 2 ;;
       --)           shift; break ;;
       -*)           die "run: unknown option '$1'" ;;
       *)          break ;;
@@ -692,7 +961,6 @@ cmd_run() {
     exec "$@"
   fi
 
-  init_state
   trap on_exit EXIT
   trap 'on_signal INT 2' INT
   trap 'on_signal TERM 15' TERM
@@ -706,12 +974,22 @@ cmd_run() {
   if [ "$NO_DEDUPE" != 1 ]; then
     EXCLUSIVE=$(resolve_exclusive)
     JOB_KEY=$(job_key "$EXCLUSIVE" "$(job_cmd_text "$@")")
-    ctl_acquire; reap; dup=$(duplicate_queued "$JOB_KEY"); ctl_release
+    ctl_acquire; dup=$(duplicate_queued "$JOB_KEY"); ctl_release
   fi
   if [ -n "$dup" ]; then
     [ "$QUIET" = 1 ] || warn "identical job $dup is queued; waiting for it instead of running twice (--no-dedupe to force)"
     cmd_wait "$dup"
     return $?
+  fi
+
+  # Gate only a job that will actually spawn; a deduped run above never does.
+  if ! task_gate_check "$B_CHILDREN"; then
+    case $B_TASK_GATE in
+      off)  : ;;
+      warn) warn "allowing spawn despite ${TASK_REASON}" ;;
+      *)    warn "refusing to spawn: ${TASK_REASON} (override: --task-gate warn|off)"
+            exit 253 ;;
+    esac
   fi
 
   JOB_ID=$(enqueue run "$tag" "$@")
@@ -721,10 +999,15 @@ cmd_run() {
 
 cmd_submit() {
   local tag=""
+  init_state
+  load_budget_defaults
   while [ $# -gt 0 ]; do
     case $1 in
       -q|--quiet) QUIET=1; shift ;;
       -t|--tag)   tag=${2:-}; shift 2 ;;
+      --cpu-quota|--mem-cap|--children|--timeout|--task-gate)
+                  [ $# -ge 2 ] || die "submit: $1 needs a value"
+                  budget_flag "$1" "$2"; shift 2 ;;
       --)         shift; break ;;
       -*)         die "submit: unknown option '$1'" ;;
       *)          break ;;
@@ -732,7 +1015,15 @@ cmd_submit() {
   done
   [ $# -gt 0 ] || die "submit: no command given"
 
-  init_state
+  if ! task_gate_check "$B_CHILDREN"; then
+    case $B_TASK_GATE in
+      off)  : ;;
+      warn) warn "allowing submit despite ${TASK_REASON}" ;;
+      *)    warn "refusing to submit: ${TASK_REASON} (override: --task-gate warn|off)"
+            exit 253 ;;
+    esac
+  fi
+
   local id child
   id=$(enqueue submit "$tag" "$@")
   : > "$JOBS_DIR/$id/log"
@@ -756,6 +1047,17 @@ cmd_worker() {
   init_state
   JOB_ID=$id
   QUIET=1
+  job_budget "$id"
+  if ! task_gate_check "$B_CHILDREN"; then
+    case $B_TASK_GATE in
+      off)  : ;;
+      warn) warn "running despite ${TASK_REASON}" ;;
+      *)    setf "$id" note "not started: ${TASK_REASON}"
+            finish "$id" 253 "not started: ${TASK_REASON}"
+            JOB_ID=""
+            return 253 ;;
+    esac
+  fi
   # Same pid the submitter recorded (nohup exec's, so the pid and its start
   # time survive); rewriting it keeps the record right if submit died early.
   set_owner "$id" "$$"
@@ -991,6 +1293,117 @@ cmd_reset() {
   printf 'reset scope %s\n' "$SCOPE"
 }
 
+cmd_budget() {
+  init_state
+  load_budget_defaults
+  local any=0 clear=0
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --clear) clear=1; any=1; shift ;;
+      --cpu-quota|--mem-cap|--children|--timeout|--task-gate)
+               [ $# -ge 2 ] || die "budget: $1 needs a value"
+               budget_flag "$1" "$2"; any=1; shift 2 ;;
+      -*)      die "budget: unknown option '$1'" ;;
+      *)       die "budget: unknown argument '$1'" ;;
+    esac
+  done
+  if [ "$any" = 1 ]; then
+    [ "$clear" = 1 ] && { B_CPU=0; B_MEM=0; B_CHILDREN=0; B_TIMEOUT=0; B_TASK_GATE=on; }
+    printf '%s\n' "$B_CPU" > "$SCOPE_DIR/cpu_quota"
+    printf '%s\n' "$B_MEM" > "$SCOPE_DIR/mem_cap"
+    printf '%s\n' "$B_CHILDREN" > "$SCOPE_DIR/children"
+    printf '%s\n' "$B_TIMEOUT" > "$SCOPE_DIR/timeout"
+    printf '%s\n' "$B_TASK_GATE" > "$SCOPE_DIR/task_gate"
+    printf 'budget for scope %s: cpu=%s millicpus mem=%s bytes children=%s timeout=%ss gate=%s\n' \
+      "$SCOPE" "$B_CPU" "$B_MEM" "$B_CHILDREN" "$B_TIMEOUT" "$B_TASK_GATE"
+    return 0
+  fi
+  local count ceiling head limit running queued
+  count=$(task_count) || count="?"
+  ceiling=$(task_ceiling) || ceiling="?"
+  if [ "$count" != "?" ] && [ "$ceiling" != "?" ]; then head=$((ceiling - count)); else head="?"; fi
+  limit=$(get_limit)
+  ctl_acquire; reap; ctl_release
+  running=$(count_state running); queued=$(count_state queued)
+  printf 'scope            %s\n' "$SCOPE"
+  printf 'queue            limit %s  running %s  queued %s\n' "$limit" "$running" "$queued"
+  printf 'cpu_quota        %s millicpus (%s cores)\n' "$B_CPU" "$(printf '%d.%03d' $((B_CPU / 1000)) $((B_CPU % 1000)))"
+  printf 'mem_cap          %s bytes (%s MiB)\n' "$B_MEM" "$((B_MEM / 1048576))"
+  printf 'children         %s (0 = unlimited)\n' "$B_CHILDREN"
+  printf 'timeout          %s s (0 = none)\n' "$B_TIMEOUT"
+  printf 'task_gate        %s (reserve %s)\n' "$B_TASK_GATE" "${LOCKOUT_TASK_HEADROOM:-64}"
+  printf 'kernel tasks     %s / %s  headroom %s\n' "$count" "$ceiling" "$head"
+  return 0
+}
+
+# The self-test proves the two failure modes this budget exists for: a spawn
+# refused at the table ceiling, and a 20s runaway loop contained well under half
+# the machine. It uses a throwaway LOCKOUT_HOME and always cleans its burners.
+SELFTEST_TOKEN=""
+SELFTEST_TMP=""
+cleanup_selftest() {
+  [ -n "$SELFTEST_TOKEN" ] && pkill -f "$SELFTEST_TOKEN" 2>/dev/null
+  [ -n "$SELFTEST_TMP" ] && rm -rf "$SELFTEST_TMP"
+  return 0
+}
+
+cmd_self_test() {
+  local T nproc half token id wrc rc elapsed cpu_ms peak survives start_ts end_ts
+  local pass=0 fail=0
+  T=$(mktemp -d "${TMPDIR:-/tmp}/lockout-selftest.XXXXXX") || die "mktemp failed"
+  nproc=$(sysctl -n hw.ncpu 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
+  half=$((nproc / 2)); [ "$half" -ge 1 ] || half=1
+  token="lockout-selftest-$$-$(now)"
+  SELFTEST_TMP=$T; SELFTEST_TOKEN=$token
+  trap cleanup_selftest EXIT INT TERM
+
+  printf 'lockout %s self-test (nproc %s, half %s)\n' "$VERSION" "$nproc" "$half"
+
+  # 1. The gate refuses to spawn when the table has no headroom.
+  printf '  %-52s' "refuses a spawn at the task-table ceiling"
+  LOCKOUT_HOME=$T LOCKOUT_SCOPE=gate LOCKOUT_TASK_GATE=on \
+    LOCKOUT_TASK_CEILING=100 LOCKOUT_TASK_COUNT=99 LOCKOUT_TASK_HEADROOM=64 \
+    "$SELF" run -- true >/dev/null 2>&1
+  rc=$?
+  if [ "$rc" = 253 ]; then pass=$((pass+1)); echo ok
+  else fail=$((fail+1)); echo FAIL; echo "      expected 253, got $rc" >&2; fi
+
+  # 2. A runaway loop that wants 20s is cut off at the wall cap, throttled to
+  #    its CPU quota meanwhile, and its fan-out held at the children cap.
+  printf '  %-52s' "contains a 20s runaway loop under half nproc"
+  local loop
+  loop="$token; i=0; while [ \$i -lt 8 ]; do (while :; do :; done) & i=\$((i+1)); done; end=\$((SECONDS+20)); while [ \$SECONDS -lt \$end ]; do sleep 1; done; wait"
+  id=$(LOCKOUT_HOME=$T LOCKOUT_SCOPE=runaway LOCKOUT_TASK_GATE=off \
+       "$SELF" submit -q --cpu-quota 2 --mem-cap 512M --children 12 --timeout 6 \
+       -- sh -c "$loop" 2>/dev/null)
+  if [ -z "$id" ]; then fail=$((fail+1)); echo FAIL; echo "      submit returned no job id" >&2
+  else
+    LOCKOUT_HOME=$T LOCKOUT_SCOPE=runaway "$SELF" wait "$id" >/dev/null 2>&1; wrc=$?
+    # getf uses the active scope; read directly through LOCKOUT_HOME scope path.
+    cpu_ms=$(cat "$T/runaway/jobs/$id/cpu_ms" 2>/dev/null || echo 0)
+    peak=$(cat "$T/runaway/jobs/$id/peak_children" 2>/dev/null || echo 0)
+    start_ts=$(cat "$T/runaway/jobs/$id/started" 2>/dev/null || echo "$(now)")
+    end_ts=$(cat "$T/runaway/jobs/$id/ended" 2>/dev/null || echo "$(now)")
+    elapsed=$((end_ts - start_ts))
+    survives=$(pgrep -f "$token" 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$wrc" = 124 ] && [ "$elapsed" -ge 4 ] && [ "$elapsed" -le 12 ] \
+       && [ "$cpu_ms" -le $((half * 1000 * elapsed * 135 / 100)) ] \
+       && [ "$peak" -le 13 ] && [ "$peak" -ge 1 ] && [ "$survives" = 0 ]; then
+      pass=$((pass+1)); echo ok
+      printf '      rc=%s elapsed=%ss cpu=%sms peak_group=%s survivors=%s\n' \
+        "$wrc" "$elapsed" "$cpu_ms" "$peak" "$survives"
+    else
+      fail=$((fail+1)); echo FAIL
+      printf '      rc=%s elapsed=%ss cpu=%sms (cap %sms) peak=%s survivors=%s\n' \
+        "$wrc" "$elapsed" "$cpu_ms" $((half * 1000 * elapsed * 135 / 100)) "$peak" "$survives" >&2
+    fi
+  fi
+
+  printf '%s passed, %s failed\n' "$pass" "$fail"
+  [ "$fail" -eq 0 ] || return 1
+  return 0
+}
+
 usage() {
   cat <<'__HELP__'
 lockout - queue expensive builds so they do not fight over the machine.
@@ -1004,15 +1417,40 @@ USAGE
   lockout logs [-f] ID                         output of a submitted job
   lockout cancel ID | all                      stop a queued or running job
   lockout limit [N]                            show or set the concurrency limit
+  lockout budget [--cpu-quota N] [--mem-cap SIZE] [--children N] [--timeout D]
+                 [--task-gate on|warn|off] [--clear]
+                                               show or set this scope's default budget
   lockout reap                                 free slots from dead processes
   lockout reset --force                        wipe this scope's state
+  lockout self-test                            prove the budget contains a runaway
   lockout version | help
 
+BUDGET (per job; scope defaults via `lockout budget`)
+  --cpu-quota N     millicpus are enforced by SIGSTOP/SIGCONT duty cycling
+                    (2 = two cores, 0.5 = half a core; 0 = unlimited)
+  --mem-cap SIZE    resident set ceiling (512M, 2G, or bytes; 0 = unlimited)
+  --children N      maximum descendant processes (0 = unlimited)
+  --timeout D       wall-clock limit (90, 30m, 2h; 0 = none)
+  --task-gate MODE  on (default) refuses to spawn without kernel-table headroom;
+                    warn allows it loudly; off disables the check
+
+The budget is the same queue and the same job record as `lockout run`: there is
+no second limiter. A budget stop exits 124 (timeout), 125 (children), 137 (memory),
+the task gate exits 253, and a job that cannot be reaped exits 254.
+
 ENVIRONMENT
-  LOCKOUT_LIMIT      concurrency limit, overrides the stored one (default 1)
-  LOCKOUT_SCOPE      queue name; separate scopes never block each other (default "default")
-  LOCKOUT_HOME       state directory (default $XDG_STATE_HOME/lockout or ~/.local/state/lockout)
-  LOCKOUT_RETENTION  seconds to keep finished jobs in status (default 3600)
+  LOCKOUT_LIMIT         concurrency limit, overrides the stored one (default 1)
+  LOCKOUT_SCOPE         queue name; separate scopes never block each other (default "default")
+  LOCKOUT_HOME          state directory (default $XDG_STATE_HOME/lockout or ~/.local/state/lockout)
+  LOCKOUT_RETENTION     seconds to keep finished jobs in status (default 3600)
+  LOCKOUT_CPU_QUOTA     default CPU quota (millicpus or cores, e.g. 2 / 0.5)
+  LOCKOUT_MEM_CAP       default memory cap (e.g. 4G)
+  LOCKOUT_CHILDREN      default descendant cap
+  LOCKOUT_TIMEOUT       default wall-clock cap
+  LOCKOUT_TASK_GATE     on|warn|off (default on)
+  LOCKOUT_TASK_HEADROOM kernel-task reserve required before a spawn (default 64)
+  LOCKOUT_TASK_CEILING  override kern.num_tasks/kern.maxproc (testing/ops)
+  LOCKOUT_TASK_COUNT    override the measured task count (testing only)
 
 NOTES
   Jobs are admitted first-come-first-served. A command run under lockout can
@@ -1021,6 +1459,8 @@ NOTES
 
 EXAMPLES
   lockout run -- cargo build --release
+  lockout run --cpu-quota 4 --mem-cap 8G --children 32 --timeout 30m -- cargo test
+  lockout budget --cpu-quota 6 --children 48 --timeout 45m
   lockout limit 2
   id=$(lockout submit -q -- cargo test); lockout wait "$id"; lockout logs "$id"
   watch -n1 lockout status
@@ -1043,8 +1483,10 @@ main() {
     logs|log)   cmd_logs "$@" ;;
     cancel|kill) cmd_cancel "$@" ;;
     limit)      cmd_limit "$@" ;;
+    budget)     cmd_budget "$@" ;;
     reap)       cmd_reap "$@" ;;
     reset)      cmd_reset "$@" ;;
+    self-test|selftest) cmd_self_test "$@" ;;
     version|--version|-V) printf '%s %s\n' "$PROG" "$VERSION" ;;
     help|--help|-h) usage ;;
     *) printf '%s: unknown command '\''%s'\''\n\n' "$PROG" "$sub" >&2; usage >&2; exit 2 ;;

@@ -41,6 +41,18 @@ max_concurrency() {
   }' "$1"
 }
 
+# Wait until the scope actually has a running job. Killing a wrapper that has
+# not finished enqueueing deletes a half-built record instead of abandoning a
+# live one, which makes the recovery tests race the admission path.
+wait_running() {
+  local i=0
+  while [ "$i" -lt 100 ]; do
+    [ "$("$LOCKOUT" status --json 2>/dev/null | grep -c '"state":"running"')" -ge 1 ] && return 0
+    sleep 0.1; i=$((i + 1))
+  done
+  return 1
+}
+
 echo "lockout tests  (state: $LOCKOUT_HOME)"
 
 # --------------------------------------------------------------- basics ----
@@ -88,7 +100,7 @@ start "limit 3 admits exactly three at a time"
 "$LOCKOUT" limit 3 >/dev/null
 trace=$TMP/trace3; : > "$trace"
 for i in 1 2 3 4 5 6; do
-  "$LOCKOUT" run -q -- sh -c "printf '+' >> '$trace'; sleep 0.6; printf -- '-' >> '$trace'; : job $i" &
+  "$LOCKOUT" run -q -- sh -c "printf '+' >> '$trace'; sleep 0.9; printf -- '-' >> '$trace'; : job $i" &
 done
 wait
 check "$(max_concurrency "$trace")" 3
@@ -121,7 +133,7 @@ scope reaping
 start "frees the slot when a holder is killed"
 "$LOCKOUT" run -q -- sleep 33.7 >/dev/null 2>&1 &
 holder=$!
-sleep 0.6
+wait_running || bad "holder never reached running" >&2
 kill -9 "$holder" 2>/dev/null
 # The orphaned child keeps running; the point is that its slot is reclaimed.
 t0=$SECONDS
@@ -164,7 +176,8 @@ start "reclaims a slot whose owner is <defunct>"
 zpid=$TMP/zombie-owner-pid; rm -f "$zpid"
 sh -c "'$LOCKOUT' run -q -- sleep 39.4 >/dev/null 2>&1 & echo \$! > '$zpid'; exec sleep 39.5" &
 guard=$!
-sleep 1.2
+wait_running || bad "zombie holder never reached running" >&2
+sleep 0.4
 victim=$(cat "$zpid" 2>/dev/null)
 kill -9 "$victim" 2>/dev/null
 sleep 0.4
@@ -183,7 +196,8 @@ start "does not mistake a recycled pid for the owner"
 # recorded identity, not the number, is what has to settle it.
 "$LOCKOUT" run -q -- sleep 40.6 >/dev/null 2>&1 &
 holder=$!
-sleep 1.5                       # the stranger must not share the owner's start second
+wait_running || bad "reused-pid holder never reached running" >&2
+sleep 1.2                       # the stranger must not share the owner's start second
 sleep 40.7 &
 stranger=$!
 kill -9 "$holder" 2>/dev/null
@@ -205,7 +219,10 @@ start "degrades to presence when ps cannot answer"
 # is the old weaker check: declaring every live job abandoned because a tool is
 # missing would be far worse than the bug the identity check fixes.
 stub=$TMP/nops-bin; mkdir -p "$stub"
-printf '#!/bin/sh\nexit 1\n' > "$stub/ps"; chmod +x "$stub/ps"
+# A symlink, not a script: this suite runs on machines where exec'ing a fresh
+# script file blocks, while exec'ing a system binary is instant. A ps that exits
+# non-zero is exactly the degraded case under test.
+ln -sf /usr/bin/false "$stub/ps"
 out=$(PATH="$stub:$PATH" "$LOCKOUT" run -q -- echo survived 2>/dev/null); rc=$?
 abandoned=$("$LOCKOUT" status --all 2>/dev/null | grep -c 'abandoned')
 [ "$rc" = 0 ] && [ "$out" = survived ] && [ "$abandoned" = 0 ] && ok \
@@ -425,7 +442,9 @@ CARGO_TARGET_DIR=/tmp/lockout-excl-e "$LOCKOUT" submit -q -- sleep 1.5 >/dev/nul
 sleep 0.2
 CARGO_TARGET_DIR=/tmp/lockout-excl-e "$LOCKOUT" submit -q -- sleep 0.2 >/dev/null
 CARGO_TARGET_DIR=/tmp/lockout-excl-f "$LOCKOUT" submit -q -- sleep 1.5 >/dev/null
-sleep 0.5
+# The budget's admission gate and worker start are not instant on a loaded
+# machine; give the third job time to reach running, not just to be enqueued.
+sleep 1.2
 running=$("$LOCKOUT" status --json | grep -o '"state":"running"' | grep -c running)
 "$LOCKOUT" cancel all >/dev/null 2>&1
 "$LOCKOUT" wait >/dev/null 2>&1
@@ -504,6 +523,75 @@ sleep 0.2
 head=$("$LOCKOUT" status | sed -n '2p')
 "$LOCKOUT" wait >/dev/null 2>&1
 case $head in *WHERE*) bad "WHERE leaked into default output" ;; *) ok ;; esac
+
+# --------------------------------------------------------------- budget -----
+
+scope budgeting
+start "budget flags are recorded on the job"
+id=$("$LOCKOUT" submit -q --cpu-quota 1.5 --mem-cap 256M --children 7 --timeout 90 -- sleep 0.2)
+"$LOCKOUT" wait "$id" >/dev/null 2>&1
+jd=$LOCKOUT_HOME/budgeting/jobs/$id
+check "$(cat "$jd/cpu_quota") $(cat "$jd/mem_cap") $(cat "$jd/children") $(cat "$jd/timeout")" \
+  "1500 268435456 7 90"
+
+start "scope budget defaults are persisted"
+"$LOCKOUT" budget --cpu-quota 2 --mem-cap 1G --children 9 --timeout 2m >/dev/null
+check "$(cat "$LOCKOUT_HOME/budgeting/cpu_quota") $(cat "$LOCKOUT_HOME/budgeting/mem_cap") $(cat "$LOCKOUT_HOME/budgeting/children") $(cat "$LOCKOUT_HOME/budgeting/timeout")" \
+  "2000 1073741824 9 120"
+
+start "a timeout stops a runaway job with 124"
+t0=$SECONDS
+"$LOCKOUT" run -q --timeout 2 -- sleep 30 >/dev/null 2>&1; rc=$?
+took=$((SECONDS - t0))
+pkill -f 'sleep 30' 2>/dev/null
+[ "$rc" = 124 ] && [ "$took" -le 6 ] && ok || bad "rc=$rc took=${took}s"
+
+start "a children cap stops a fork bomb with 125"
+"$LOCKOUT" run -q --children 1 --timeout 10 -- sh -c 'sleep 20 & sleep 20 & wait' >/dev/null 2>&1; rc=$?
+pkill -f 'sleep 20' 2>/dev/null
+check "$rc" 125
+
+start "the task gate refuses to spawn at the ceiling"
+LOCKOUT_TASK_CEILING=100 LOCKOUT_TASK_COUNT=99 LOCKOUT_TASK_HEADROOM=64 \
+  "$LOCKOUT" run --task-gate on -- true >/dev/null 2>&1
+check "$?" 253
+
+start "the budget self-test contains a 20s runaway loop"
+"$LOCKOUT" self-test >/dev/null 2>&1
+check "$?" 0
+
+# ------------------------------------------------------------ cargo home ----
+
+# The shim hands cargo a per-agent CARGO_HOME so agents do not serialize on
+# the shared package-cache lock. Fake binaries keep this independent of the
+# real fpl-bob and cargo.
+scope cargo_home
+mkdir -p "$TMP/fakebob" "$TMP/fakecargo"
+cat > "$TMP/fakebob/fpl-bob" <<'FAKE'
+#!/bin/sh
+[ "${1:-}" = cargo-home ] || exit 1
+printf '%s' "${FAKE_HOME:-}"
+FAKE
+cat > "$TMP/fakecargo/cargo" <<'FAKE'
+#!/bin/sh
+printf '%s' "${CARGO_HOME:-unset}"
+FAKE
+chmod +x "$TMP/fakebob/fpl-bob" "$TMP/fakecargo/cargo"
+SHIM=$HERE/../shim/cargo
+
+start "cargo shim sets CARGO_HOME from BOB_AGENT_KEY"
+out=$(PATH="$TMP/fakebob:$TMP/fakecargo:/usr/bin:/bin" \
+  BOB_AGENT_KEY=agent-1 FAKE_HOME="$TMP/agent-home" "$SHIM" --version)
+check "$out" "$TMP/agent-home"
+
+start "cargo shim respects an explicit CARGO_HOME"
+out=$(PATH="$TMP/fakebob:$TMP/fakecargo:/usr/bin:/bin" \
+  BOB_AGENT_KEY=agent-1 FAKE_HOME="$TMP/agent-home" CARGO_HOME=/explicit "$SHIM" --version)
+check "$out" "/explicit"
+
+start "cargo shim works without fpl-bob"
+out=$(PATH="$TMP/fakecargo:/usr/bin:/bin" "$SHIM" --version)
+check "$out" "unset"
 
 # ---------------------------------------------------------------------------
 
